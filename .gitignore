@@ -1,0 +1,19 @@
+# Build output.  Everything here is reproducible from the sources plus
+# build.bat, including the packs and the icon.
+/build/
+
+# The pre-split copy of the Win32 backend, kept while the split settles.
+*.orig
+
+# Editor and OS leavings.
+*.obj
+*.res
+*.map
+*.pdb
+*.ilk
+Thumbs.db
+desktop.ini
+
+# Python bytecode from the tools.
+__pycache__/
+*.pyc
