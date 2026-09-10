@@ -17,3 +17,25 @@ desktop.ini
 # Python bytecode from the tools.
 __pycache__/
 *.pyc
+
+# The Game Boy toolchain, installed into the project by tools/setup_gb.ps1.
+# Fourteen megabytes of prebuilt binaries belong in a download, not in git.
+/tools/gbdk-2020/
+
+# The v86 emulator and its FreeDOS guest, installed into the project by
+# tools/setup_v86.ps1.  Prebuilt WebAssembly, two BIOS images and an operating
+# system: a download, not a commit.  Any Windows image you supply goes in the
+# same directory and is covered by the same line -- which is deliberate,
+# because Windows is not redistributable and must not be committed here.
+/tools/v86/
+
+# The QEMU Windows 95 stand, prepared by tools/qemu95.ps1 setup: a qcow2
+# converted from the raw image tools/v86 holds, the payload floppy, and the
+# snapshots savevm writes inside the qcow2.  Half a gigabyte, and the same
+# reason as above -- Windows is not redistributable and must not be committed.
+/tools/qemu95/
+
+# Open Watcom, installed into the project by tools/setup_watcom.ps1.  It is
+# the only compiler still emitting 16-bit real-mode code, and it arrives as a
+# 145 MB download; that belongs in a download too, not in git.
+/tools/watcom/
