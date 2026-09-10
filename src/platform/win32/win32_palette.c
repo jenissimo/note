@@ -36,9 +36,15 @@
  * another author's this pass, so the mode is numbered here and reached
  * through pal_open_rename() rather than by name through pal_open_mode(). */
 #define PAL_MODE_RENAME  PAL_MODE_COUNT
-#define PAL_MODE_TOTAL  (PAL_MODE_COUNT + 1)
+#define PAL_MODE_RUN    (PAL_MODE_COUNT + 1)
+#define PAL_MODE_TOTAL  (PAL_MODE_COUNT + 2)
 
 static note_palette g_pal;
+
+/* Where the pointer was when the overlay last let it choose a row; see
+ * WM_MOUSEMOVE in PaletteProc.  Screen coordinates, so that the panel
+ * changing size underneath does not read as movement. */
+static POINT g_pal_mouse;
 
 void pal_close(note_host *h);
 
@@ -56,11 +62,20 @@ static int pal_rows_shown(void)
  * Every one of them may be NULL.
  * ------------------------------------------------------------------------- */
 
+/* Adding a field here means visiting every row of kPalModes, including the
+ * ones another author owns.  C fills a short initialiser with zeroes rather
+ * than refusing it, so a row nobody updated keeps compiling and quietly means
+ * whatever the new field's zero happens to mean -- which is the one kind of
+ * merge this file cannot tell you about. */
 typedef struct {
     const WCHAR *title;       /* drawn ahead of the query, or NULL           */
     const WCHAR *hint;        /* placeholder while nothing has been typed    */
     const WCHAR *empty;       /* when the query matches nothing              */
     void (*fill)   (note_host *h);
+    /* Called before every re-rank, for a mode whose rows depend on the query
+     * rather than merely being filtered by it -- a listing of the folder the
+     * path names, which changes as the path does. */
+    void (*retype) (note_host *h);
     void (*enter)  (note_host *h);                        /* what to restore */
     void (*preview)(note_host *h, const note_pal_row *r);
     /* Returns 1 when the palette is done and may close, 0 to stay open —
@@ -69,6 +84,10 @@ typedef struct {
     void (*cancel) (note_host *h);
     int   typed;              /* the query is the answer, not a filter       */
     int   digits;             /* ...and it may only be digits                */
+    /* The query is a path and the rows are the names in its last folder: the
+     * two halves of the query are drawn differently, a row whose id is set is
+     * a folder rather than a file, and Tab walks the list. */
+    int   paths;
 } pal_mode;
 
 /* --- commands --- */
@@ -145,38 +164,31 @@ static void pal_set_face(note_host *h, const WCHAR *face)
     service_view(h);
 }
 
-static int CALLBACK pal_font_enum(const LOGFONTW *lf, const TEXTMETRICW *tm,
-                                  DWORD type, LPARAM lp)
+static int pal_font_enum(const nchar *face, unsigned pitch_family)
 {
     int i;
-    (void)type; (void)lp;
 
     /* TMPF_FIXED_PITCH is set for the variable-pitch fonts — the flag is named
      * after the bit, not after what it means.  "@Face" is the same font laid
      * out for vertical CJK text and has no business in an editor. */
-    if (tm->tmPitchAndFamily & TMPF_FIXED_PITCH) return 1;
-    if (lf->lfFaceName[0] == L'@') return 1;
+    if (pitch_family & TMPF_FIXED_PITCH) return 1;
+    if (face[0] == (nchar)'@') return 1;
 
     /* One family is enumerated once per character set it covers. */
     for (i = 0; i < g_pal.nrows; i++)
-        if (n_eq(g_pal.rows[i].label, (const nchar *)lf->lfFaceName)) return 1;
+        if (n_eq(g_pal.rows[i].label, face)) return 1;
 
-    return note_palette_add_copy(&g_pal, 0, (const nchar *)lf->lfFaceName, 0)
-           ? 1 : 0;
+    return note_palette_add_copy(&g_pal, 0, face, 0) ? 1 : 0;
 }
 
 static void pal_fill_font(note_host *h)
 {
-    LOGFONTW want;
     HDC dc;
 
     note_palette_reset(&g_pal);
 
-    memset(&want, 0, sizeof(want));
-    want.lfCharSet = DEFAULT_CHARSET;
-
     dc = GetDC(h->wnd);
-    EnumFontFamiliesExW(dc, &want, pal_font_enum, 0, 0);
+    os_enum_fonts(dc, pal_font_enum);
     ReleaseDC(h->wnd, dc);
 
     note_palette_filter(&g_pal);
@@ -202,9 +214,9 @@ static void pal_cancel_font(note_host *h)
 
 static void pal_enter_line(note_host *h)
 {
-    CHARRANGE c;
-    SendMessageW(active_edit(), EM_EXGETSEL, 0, (LPARAM)&c);
-    h->pal_caret_prev = (int)c.cpMin;
+    int from, to;
+    h_sel_get(h, &from, &to);
+    h->pal_caret_prev = from;
 }
 
 /* Nothing is selected here: the query itself is the answer, so the preview
@@ -227,7 +239,7 @@ static int pal_commit_line(note_host *h, const note_pal_row *r)
 static void pal_cancel_line(note_host *h)
 {
     h_sel_set(h, h->pal_caret_prev, h->pal_caret_prev);
-    SendMessageW(active_edit(), EM_SCROLLCARET, 0, 0);
+    edit_show_caret(h);
 }
 
 static void pal_fill_none(note_host *h)
@@ -318,30 +330,337 @@ static int pal_commit_rename(note_host *h, const note_pal_row *r)
     return note_rename(&h->app, h->app.active, note_palette_query(&g_pal));
 }
 
+/* --- run a command ---
+ *
+ * The smallest thing that makes an editor somewhere you can work: a command
+ * line that starts in the folder of the file on screen.  The rows are what has
+ * been run before, so the common case -- run the same thing again -- is two
+ * keys, and the query is still free text, so a new command needs no ceremony.
+ */
+
+#define RUN_HIST 12
+
+static nchar g_run_hist[RUN_HIST][NOTE_PALETTE_LABEL];
+static int   g_run_nhist;
+
+static void run_hist_push(const nchar *cmd)
+{
+    int i, dup = -1;
+
+    if (!cmd || !cmd[0]) return;
+
+    for (i = 0; i < g_run_nhist; i++)
+        if (n_eq(g_run_hist[i], cmd)) { dup = i; break; }
+
+    /* A repeat moves to the front rather than adding a second copy: the list
+     * is meant to answer "what do I keep running", not "what did I type". */
+    if (dup < 0 && g_run_nhist < RUN_HIST) dup = g_run_nhist++;
+    if (dup < 0) dup = RUN_HIST - 1;
+
+    for (i = dup; i > 0; i--) n_copy(g_run_hist[i], g_run_hist[i - 1],
+                                     NOTE_PALETTE_LABEL);
+    n_copy(g_run_hist[0], cmd, NOTE_PALETTE_LABEL);
+}
+
+static void pal_fill_run(note_host *h)
+{
+    int i;
+
+    (void)h;
+    note_palette_reset(&g_pal);
+    for (i = 0; i < g_run_nhist; i++)
+        note_palette_add_copy(&g_pal, (unsigned)i, g_run_hist[i], N("again"));
+    note_palette_filter(&g_pal);
+}
+
+static int pal_commit_run(note_host *h, const note_pal_row *r)
+{
+    nchar  cmd[NOTE_PALETTE_LABEL], dir[NOTE_PATH_MAX], line[NOTE_PATH_MAX];
+    const nchar        *path = h->app.docs[h->app.active].path;
+    int                 i, cut = -1;
+
+    /* Typed text wins; an untouched query means the highlighted row. */
+    n_copy(cmd, note_palette_query(&g_pal), NOTE_PALETTE_LABEL);
+    if (!cmd[0] && r) n_copy(cmd, r->label, NOTE_PALETTE_LABEL);
+    if (!cmd[0]) return 0;
+
+    run_hist_push(cmd);
+
+    /* Running the file as it was two edits ago is the one way this can waste
+     * an afternoon, so a named, modified document is written out first. */
+    if (path[0] && h->app.docs[h->app.active].dirty)
+        note_command(&h->app, CMD_FILE_SAVE);
+
+    for (i = 0; path[i]; i++)
+        if (path[i] == (nchar)'\\' || path[i] == (nchar)'/') cut = i;
+    if (cut > 0) {
+        for (i = 0; i < cut && i < NOTE_PATH_MAX - 1; i++) dir[i] = path[i];
+        dir[i] = 0;
+    } else {
+        dir[0] = 0;
+    }
+
+    /* cmd.exe /k, in a console of its own: the output is the point, and a
+     * window that closed the moment the command finished would hide it. */
+    n_copy(line, N("cmd.exe /k "), NOTE_PATH_MAX);
+    n_cat (line, cmd, NOTE_PATH_MAX);
+
+    if (os_run(line, dir)) return 1;
+
+    h_set_hint_text(h, N("Could not start that command"));
+    return 0;
+}
+
+/* --- open a file by typing its path ---
+ *
+ * The query is the answer, as in rename, but unlike rename it also names a
+ * place -- so the rows are what is in that place.  Everything up to the last
+ * separator is the folder, which gets listed; what follows it is the fragment
+ * being completed, which is what the rows are filtered on.  That is the whole
+ * of the mode: Tab keeps the selected name, a folder brings its own separator
+ * with it, and the next listing follows from the query the way the first one
+ * did.
+ *
+ * It does not replace the system dialog on Ctrl+O.  Someone who knows where
+ * the file is should not have to go and find it in a tree, and someone who
+ * does not should still get the dialog that can search, preview and sort.
+ */
+
+static void pal_reveal(note_host *h);      /* further down; the walk scrolls */
+
+static int is_sep(nchar c)
+{
+    return c == (nchar)'\\' || c == (nchar)'/';
+}
+
+/* Where the fragment being completed starts: just past the last separator. */
+static int leaf_at(const nchar *q)
+{
+    int i, at = 0;
+    for (i = 0; q[i]; i++) if (is_sep(q[i])) at = i + 1;
+    return at;
+}
+
+/* The query's folder, with its trailing separator, into `out`. */
+static void folder_part(const nchar *q, nchar *out, int cap)
+{
+    int at = leaf_at(q), i;
+    for (i = 0; i < at && i < cap - 1; i++) out[i] = q[i];
+    out[i] = 0;
+}
+
+static void pal_fill_open(note_host *h)
+{
+    const nchar     *q = note_palette_query(&g_pal);
+    const nchar     *frag;
+    nchar            pattern[NOTE_PATH_MAX];
+    os_find          find;
+    int              at = leaf_at(q);
+
+    note_palette_reset_rows(&g_pal);
+
+    /* While Tab is walking the matches the list belongs to the stem that was
+     * typed, not to the name Tab has just completed to -- otherwise the first
+     * Tab would leave one row and there would be nothing left to walk.  The
+     * filter is switched off for the duration and the stem is applied here
+     * instead, which also keeps the rows in the folder's own order. */
+    if (h->pal_cycle >= 0) {
+        note_palette_filter_from(&g_pal, n_len(q));
+        frag = (const nchar *)h->pal_stem;
+    } else {
+        note_palette_filter_from(&g_pal, at);
+        frag = note_palette_filter_text(&g_pal);
+    }
+
+    /* Nothing that names a folder yet -- a bare "C" or an empty line.  There
+     * is nothing to list, and guessing a drive would be worse than waiting. */
+    if (!at) { note_palette_filter(&g_pal); return; }
+
+    folder_part(q, pattern, NOTE_PATH_MAX - 2);
+    n_cat(pattern, N("*"), NOTE_PATH_MAX);
+
+    if (os_find_open(pattern, &find)) {
+        do {
+            nchar         name[NOTE_PALETTE_LABEL];
+            unsigned char mark[NOTE_PALETTE_LABEL];
+            int           dir = (find.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            if (find.name[0] == (nchar)'.' &&
+                (!find.name[1] ||
+                 (find.name[1] == (nchar)'.' && !find.name[2]))) continue;
+
+            n_copy(name, find.name, NOTE_PALETTE_LABEL);
+            /* A folder carries its own separator, so completing to one
+             * descends into it rather than stopping on its name. */
+            if (dir) n_cat(name, N("\\"), NOTE_PALETTE_LABEL);
+
+            /* Filtered on the way in rather than afterwards: a folder with ten
+             * thousand files in it would otherwise fill the row pool long
+             * before reaching the name being typed. */
+            if (frag[0] &&
+                !note_palette_marks(name, frag, mark, NOTE_PALETTE_LABEL))
+                continue;
+
+            /* The id says which rows are folders, which is all the difference
+             * committing one has to know about. */
+            if (!note_palette_add_copy(&g_pal, (unsigned)dir, name, 0)) break;
+        } while (os_find_step(&find));
+        os_find_close(&find);
+    }
+
+    note_palette_filter(&g_pal);
+
+    /* Ranking is done; point the filter back at the last segment so that the
+     * input line still draws the folder quietly and the name in the text
+     * colour.  Nothing re-ranks until the next keystroke, and that ends the
+     * walk anyway. */
+    if (h->pal_cycle >= 0) note_palette_filter_from(&g_pal, at);
+}
+
+/* Somewhere to start from: the folder of the document on screen, and failing
+ * that -- an untitled buffer -- wherever note was started. */
+static void pal_enter_open(note_host *h)
+{
+    nchar seed[NOTE_PATH_MAX];
+    const nchar *p = h->app.docs[h->app.active].path;
+
+    if (leaf_at(p) > 0) {
+        folder_part(p, seed, NOTE_PATH_MAX);
+    } else {
+        DWORD n = os_current_dir(seed, NOTE_PATH_MAX);
+        if (!n || n >= NOTE_PATH_MAX) seed[0] = 0;
+        else if (!is_sep(seed[n - 1])) n_cat(seed, N("\\"), NOTE_PATH_MAX);
+    }
+    h->pal_stem[0] = 0;
+    h->pal_cycle   = -1;
+    note_palette_set(&g_pal, seed, 0);
+}
+
+/* Replaces the query and relists, which is what both Tab and a folder taken
+ * with Enter come down to. */
+static void pal_open_goto(note_host *h, const nchar *path)
+{
+    h->pal_cycle = -1;
+    note_palette_set(&g_pal, path, 0);
+    pal_fill_open(h);
+    h->pal_sel = 0;
+    h->pal_top = 0;
+    h->pal_msg[0] = 0;
+    pal_layout(h);
+    if (h->pal) InvalidateRect(h->pal, NULL, FALSE);
+}
+
+/* Tab and Shift+Tab: the next name the stem matched, in place of the
+ * fragment.  The first press remembers what was typed and takes the best
+ * match; every press after that walks the same list, forwards or back, the
+ * way a shell's completion does. */
+static int pal_open_complete(note_host *h, int step)
+{
+    const note_pal_row *r;
+    nchar path[NOTE_PATH_MAX];
+    int   n;
+
+    if (h->pal_cycle < 0) {
+        /* What has been typed is the stem from here on. */
+        const nchar *q = note_palette_query(&g_pal);
+        n_copy((nchar *)h->pal_stem, q + leaf_at(q), NOTE_PATH_MAX);
+        h->pal_cycle = 0;
+        pal_fill_open(h);            /* the same rows, now held by the stem */
+        if (step < 0) h->pal_cycle = note_palette_count(&g_pal) - 1;
+    } else {
+        h->pal_cycle += step;
+    }
+
+    n = note_palette_count(&g_pal);
+    if (n <= 0) { h->pal_cycle = -1; return 0; }
+
+    /* Round and round: a list of two is quicker to walk than to aim at. */
+    while (h->pal_cycle < 0)  h->pal_cycle += n;
+    while (h->pal_cycle >= n) h->pal_cycle -= n;
+
+    r = note_palette_at(&g_pal, h->pal_cycle);
+    if (!r) { h->pal_cycle = -1; return 0; }
+
+    folder_part(note_palette_query(&g_pal), path, NOTE_PATH_MAX);
+    n_cat(path, r->label, NOTE_PATH_MAX);
+
+    note_palette_set(&g_pal, path, 0);
+    pal_fill_open(h);
+    h->pal_sel = h->pal_cycle;
+    h->pal_msg[0] = 0;
+    pal_reveal(h);
+    pal_layout(h);
+    if (h->pal) InvalidateRect(h->pal, NULL, FALSE);
+    return 1;
+}
+
+static int pal_commit_open(note_host *h, const note_pal_row *r)
+{
+    nchar path[NOTE_PATH_MAX];
+    DWORD attr;
+
+    n_copy(path, note_palette_query(&g_pal), NOTE_PATH_MAX);
+    attr = os_file_attrs(path);
+
+    /* A file, exactly as typed: that is the answer. */
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        note_open(&h->app, path);
+        return 1;
+    }
+
+    /* Otherwise Enter does what Tab does, so the same key that got here keeps
+     * getting there: take the selected row and stay open. */
+    if (r && pal_open_complete(h, 0)) return 0;
+
+    /* A folder with nothing in it worth showing still deserves its separator,
+     * so that the next thing typed is a name inside it. */
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+        if (!is_sep(path[n_len(path) - 1])) {
+            n_cat(path, N("\\"), NOTE_PATH_MAX);
+            pal_open_goto(h, path);
+        }
+        return 0;
+    }
+
+    h_set_hint_text(h, N("No such file"));
+    return 0;
+}
+
+/* One row per mode, in the order the enum names them; the array bound is what
+ * catches a mode added without a row.  Nothing catches a row missing a field
+ * -- see the note on pal_mode. */
 static const pal_mode kPalModes[PAL_MODE_TOTAL] = {
     { NULL,       L"Type a command",  L"No matching command",
-      pal_fill_cmds,  NULL,            NULL,
-      pal_run_cmd,    NULL,            0, 0 },
+      pal_fill_cmds,  NULL,            NULL,            NULL,
+      pal_run_cmd,    NULL,            0, 0, 0 },
 
     { L"Theme",   L"Filter palettes", L"No matching palette",
-      pal_fill_theme, pal_enter_theme, pal_preview_theme,
-      pal_commit_theme, pal_cancel_theme, 0, 0 },
+      pal_fill_theme, NULL,            pal_enter_theme, pal_preview_theme,
+      pal_commit_theme, pal_cancel_theme, 0, 0, 0 },
 
     { L"Font",    L"Filter faces",    L"No matching face",
-      pal_fill_font,  pal_enter_font,  pal_preview_font,
-      NULL,           pal_cancel_font, 0, 0 },
+      pal_fill_font,  NULL,            pal_enter_font,  pal_preview_font,
+      NULL,           pal_cancel_font, 0, 0, 0 },
 
     { L"Go to line", L"Line number",  L"Type a line number",
-      pal_fill_none,  pal_enter_line,  pal_preview_line,
-      pal_commit_line, pal_cancel_line, 1, 1 },
+      pal_fill_none,  NULL,            pal_enter_line,  pal_preview_line,
+      pal_commit_line, pal_cancel_line, 1, 1, 0 },
 
     { L"Go to tab", L"Filter open tabs", L"No matching tab",
-      pal_fill_tabs,  NULL,            NULL,
-      pal_commit_tab, NULL,            0, 0 },
+      pal_fill_tabs,  NULL,            NULL,            NULL,
+      pal_commit_tab, NULL,            0, 0, 0 },
+
+    { L"Open",    L"Path to a file",  L"Nothing here by that name",
+      pal_fill_open,  pal_fill_open,   pal_enter_open,  NULL,
+      pal_commit_open, NULL,           1, 0, 1 },
 
     { L"Rename",  L"New file name",   L"Enter returns the new name",
-      pal_fill_rename, NULL,           NULL,
-      pal_commit_rename, NULL,         1, 0 }
+      pal_fill_rename, NULL,           NULL,            NULL,
+      pal_commit_rename, NULL,         1, 0, 0 },
+
+    { L"Run",     L"Command, from this file's folder", L"Nothing run yet",
+      pal_fill_run, NULL,             NULL,            NULL,
+      pal_commit_run, NULL,           1, 0, 0 }
 };
 
 static const pal_mode *pal_cur(note_host *h)
@@ -352,6 +671,7 @@ static const pal_mode *pal_cur(note_host *h)
 
 /* Near the top and horizontally centred over the editor, growing and
  * shrinking with the number of matches. */
+
 void pal_layout(note_host *h)
 {
     RECT  rc;
@@ -391,10 +711,14 @@ static void pal_reveal(note_host *h)
 
 /* Draws one label, colouring the characters the filter matched.  Runs of the
  * same colour go out together so the text still kerns as a word rather than
- * as a column of letters. */
-static void pal_draw_label(HDC dc, const nchar *s, const unsigned char *mark,
-                           int nmark, int x, int y, int right,
-                           COLORREF plain, COLORREF hit)
+ * as a column of letters.
+ *
+ * Returns the x it stopped at, so that whatever follows the label -- a
+ * toggle's state -- starts where the label ended rather than at a column
+ * guessed from the longest one. */
+static int pal_draw_label(HDC dc, const nchar *s, const unsigned char *mark,
+                          int nmark, int x, int y, int right,
+                          COLORREF plain, COLORREF hit)
 {
     int i = 0, m = 0, len = n_len(s);
 
@@ -417,6 +741,82 @@ static void pal_draw_label(HDC dc, const nchar *s, const unsigned char *mark,
         x += sz.cx;
         i += run;
     }
+
+    return x;
+}
+
+/* How readable `want` is on `bg`: the difference in weighted brightness, by
+ * the same weights the core reduces a theme with. */
+static int pal_contrast(COLORREF bg, COLORREF want)
+{
+    int a = (GetRValue(bg)   * 77 + GetGValue(bg)   * 151 + GetBValue(bg)   * 28) >> 8;
+    int b = (GetRValue(want) * 77 + GetGValue(want) * 151 + GetBValue(want) * 28) >> 8;
+    return a > b ? a - b : b - a;
+}
+
+/* A colour that can still be read on `bg`.
+ *
+ * Two colours an author wrote as different can land on the same palette entry
+ * once the display has had its say -- note_theme_reduce() picks the nearest
+ * entry for each, and chrome_snap() does the same to everything mixed from
+ * them afterwards.  A label drawn in the colour of the band underneath it is
+ * not dim, it is absent, which is what the selected row was.  So the panel
+ * asks for a colour rather than naming one: the theme's, while it reads, and
+ * plain black or white -- both in every palette there is -- when it does
+ * not. */
+static COLORREF pal_legible(COLORREF bg, COLORREF want)
+{
+    if (pal_contrast(bg, want) >= 48) return want;
+    return chrome_snap(pal_contrast(bg, RGB(0, 0, 0)) >
+                       pal_contrast(bg, RGB(255, 255, 255))
+                       ? RGB(0, 0, 0) : RGB(255, 255, 255));
+}
+
+/* The hairline that says where the panel stops.
+ *
+ * It matters more than it looks: a theme whose ui_bg reduces onto the
+ * editor's own background leaves an opaque panel that is the same colour as
+ * the file behind it, and with the frame reduced onto that colour as well
+ * there is nothing at all to say the list is a surface rather than text
+ * floating over the document.  Quiet if it can be, the text colour if it
+ * cannot, and failing both whatever is legible. */
+static COLORREF pal_edge(note_host *h, COLORREF surface)
+{
+    COLORREF c = blend_rgb(h->theme.ui_fg, h->theme.ui_bg);
+
+    if (pal_contrast(surface, c) < 48) c = cr(h->theme.ui_fg);
+    return pal_legible(surface, c);
+}
+
+/* -1 when the command is not a toggle, otherwise the state it is in.  Which
+ * commands are checkable comes from note_menu, the table the menu bar is built
+ * from, so an entry cannot be a toggle in one list and plain in the other. */
+static int pal_check_state(note_host *h, unsigned id)
+{
+    const note_menu_item *it = note_menu;
+
+    if (h->pal_mode != PAL_MODE_CMDS || !id) return -1;
+
+    while (it->kind == MI_POPUP) {
+        for (it++; it->kind != MI_END; it++)
+            if ((unsigned)it->id == id &&
+                (it->kind == MI_CHECK || it->kind == MI_RADIO))
+                return note_menu_check(&h->app, it->id) ? 1 : 0;
+        it++;                       /* step past the popup's MI_END */
+    }
+    return -1;
+}
+
+/* What a toggle's state is called on a row.  Words rather than a tick: a
+ * drawn mark is a foreground on a background, and on a display that has
+ * reduced the theme those two can be the same entry -- the very failure the
+ * selected row was showing.  Text goes down the same path the label does and
+ * is legible for the same reason.  It is drawn, never matched: the filter
+ * still sees "View: Word Wrap" and typing "on" does not select every switch
+ * that happens to be on. */
+static const nchar *pal_state_text(int on)
+{
+    return on ? N(" (on)") : N(" (off)");
 }
 
 static void pal_paint(note_host *h, HWND wnd)
@@ -428,6 +828,7 @@ static void pal_paint(note_host *h, HWND wnd)
     HFONT   old;
     HBRUSH  br;
     TEXTMETRICW tm;
+    COLORREF surface, edge;
     int     i, rows, y, textx;
 
     dc = BeginPaint(wnd, &ps);
@@ -438,6 +839,9 @@ static void pal_paint(note_host *h, HWND wnd)
     bmp    = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
     oldbmp = (HBITMAP)SelectObject(mem, bmp);
 
+    surface = cr(h->theme.ui_bg);
+    edge    = pal_edge(h, surface);
+
     FillRect(mem, &rc, h->br_ui);
 
     band = rc;
@@ -445,7 +849,7 @@ static void pal_paint(note_host *h, HWND wnd)
     FillRect(mem, &band, h->br_edit);
 
     old = (HFONT)SelectObject(mem, h->menufont);
-    GetTextMetricsW(mem, &tm);
+    os_text_metrics(mem, &tm);
     SetBkMode(mem, TRANSPARENT);
     textx = px(PAL_PAD) + px(4);
 
@@ -472,7 +876,7 @@ static void pal_paint(note_host *h, HWND wnd)
             mr.left = qr.right - ms.cx;
             if (mr.left < qr.left) mr.left = qr.left;
             SetTextColor(mem, cr(h->theme.tok[TOK_NUMBER]));
-            DrawTextW(mem, h->pal_msg, -1, &mr,
+            os_draw_text(mem, h->pal_msg, -1, &mr,
                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             qr.right = mr.left - px(10);
         }
@@ -481,14 +885,31 @@ static void pal_paint(note_host *h, HWND wnd)
          * window whatever it is showing, so it has to say. */
         if (m->title) {
             SIZE ts;
-            SetTextColor(mem, cr(h->theme.tok[TOK_KEYWORD]));
-            DrawTextW(mem, m->title, -1, &qr,
+            SetTextColor(mem, pal_legible(cr(h->theme.bg),
+                                          cr(h->theme.tok[TOK_KEYWORD])));
+            os_draw_text(mem, m->title, -1, &qr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             GetTextExtentPoint32W(mem, m->title, n_len((const nchar *)m->title), &ts);
             qr.left += ts.cx + px(10);
         }
 
-        if (q[0]) {
+        if (q[0] && m->paths) {
+            /* A path reads as a place and a name, so it is drawn as two: the
+             * folder quietly, because it is where the eye has already been,
+             * and what is being typed in the text colour. */
+            int   cut = note_palette_filter_at(&g_pal);
+            int   ty  = qr.top + (qr.bottom - qr.top - tm.tmHeight) / 2;
+            int   len = n_len(q);
+            SIZE  hs;
+
+            SetTextColor(mem, blend_rgb(h->theme.fg, h->theme.bg));
+            TextOutW(mem, qr.left, ty, (LPCWSTR)q, cut);
+            GetTextExtentPoint32W(mem, (LPCWSTR)q, cut, &hs);
+            SetTextColor(mem, cr(h->theme.fg));
+            TextOutW(mem, qr.left + hs.cx, ty, (LPCWSTR)(q + cut), len - cut);
+            GetTextExtentPoint32W(mem, (LPCWSTR)q, note_palette_caret(&g_pal), &sz);
+
+        } else if (q[0]) {
             int a, b;
 
             /* The selection goes down first, in the editor's own selection
@@ -506,13 +927,14 @@ static void pal_paint(note_host *h, HWND wnd)
             }
 
             SetTextColor(mem, cr(h->theme.fg));
-            DrawTextW(mem, (LPCWSTR)q, -1, &qr,
+            os_draw_text(mem, q, -1, &qr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             /* The caret sits where the caret is, not at the end. */
             GetTextExtentPoint32W(mem, (LPCWSTR)q, note_palette_caret(&g_pal), &sz);
         } else {
-            SetTextColor(mem, blend_rgb(h->theme.fg, h->theme.bg));
-            DrawTextW(mem, m->hint, -1, &qr,
+            SetTextColor(mem, pal_legible(cr(h->theme.bg),
+                                          blend_rgb(h->theme.fg, h->theme.bg)));
+            os_draw_text(mem, m->hint, -1, &qr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
 
@@ -537,20 +959,45 @@ static void pal_paint(note_host *h, HWND wnd)
         const note_pal_row *c = note_palette_at(&g_pal, idx);
         unsigned char mark[NOTE_PALETTE_LABEL];
         RECT r;
-        int  nmark;
+        COLORREF rbg, plain, dim;
+        int  nmark, check, tx, ty, tw;
 
         if (!c) break;
 
         r.left = 0; r.right = rc.right;
         r.top  = y; r.bottom = y + px(PAL_ROW_H);
-        if (idx == h->pal_sel) FillRect(mem, &r, h->br_menusel);
+        rbg = surface;
+        if (idx == h->pal_sel) {
+            FillRect(mem, &r, h->br_menusel);
+            rbg = cr(h->theme.sel_bg);
+        }
 
-        nmark = note_palette_marks(c->label, note_palette_query(&g_pal), mark,
-                                   NOTE_PALETTE_LABEL);
-        pal_draw_label(mem, c->label, mark, nmark,
-                       textx, r.top + (px(PAL_ROW_H) - tm.tmHeight) / 2,
-                       rc.right - px(96),
-                       cr(h->theme.ui_fg), cr(h->theme.tok[TOK_KEYWORD]));
+        /* Every colour in the row is asked for against the band it is landing
+         * on, not against the one the theme was written for. */
+        plain = pal_legible(rbg, (pal_cur(h)->paths && c->id)
+                                 ? cr(h->theme.tok[TOK_TYPE])
+                                 : cr(h->theme.ui_fg));
+        dim   = pal_legible(rbg, blend_rgb(h->theme.ui_fg, h->theme.ui_bg));
+
+        nmark = note_palette_marks(c->label, note_palette_filter_text(&g_pal),
+                                   mark, NOTE_PALETTE_LABEL);
+        /* In a folder listing a folder is not a file, and saying so in
+         * colour saves a column of icons. */
+        ty = r.top + (px(PAL_ROW_H) - tm.tmHeight) / 2;
+        tw = rc.right - px(96);
+        tx = pal_draw_label(mem, c->label, mark, nmark, textx, ty, tw,
+                            plain,
+                            pal_legible(rbg, cr(h->theme.tok[TOK_KEYWORD])));
+
+        /* A toggle says which way it is set, quietly, just past its name.
+         * Read at paint time, so it is the state as it stands and not as it
+         * was when the list was built. */
+        check = pal_check_state(h, c->id);
+        if (check >= 0 && tx < tw) {
+            const nchar *st = pal_state_text(check);
+            SetTextColor(mem, dim);
+            TextOutW(mem, tx, ty, (LPCWSTR)st, n_len(st));
+        }
 
         /* The accelerator on the right, as the menus show it: the palette is
          * meant to teach the shortcut, not to replace it.  A mode's rows are
@@ -558,8 +1005,8 @@ static void pal_paint(note_host *h, HWND wnd)
         if (c->accel && c->accel[0]) {
             RECT ar = r;
             ar.right -= textx;
-            SetTextColor(mem, blend_rgb(h->theme.ui_fg, h->theme.ui_bg));
-            DrawTextW(mem, (LPCWSTR)c->accel, -1, &ar,
+            SetTextColor(mem, dim);
+            os_draw_text(mem, (LPCWSTR)c->accel, -1, &ar,
                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
         y = r.bottom;
@@ -570,14 +1017,17 @@ static void pal_paint(note_host *h, HWND wnd)
         nr.top    = px(PAL_INPUT_H);
         nr.bottom = nr.top + px(PAL_ROW_H);
         nr.left   = textx;
-        SetTextColor(mem, blend_rgb(h->theme.ui_fg, h->theme.ui_bg));
-        DrawTextW(mem, pal_cur(h)->empty, -1, &nr,
+        SetTextColor(mem, pal_legible(surface,
+                                      blend_rgb(h->theme.ui_fg, h->theme.ui_bg)));
+        os_draw_text(mem, pal_cur(h)->empty, -1, &nr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
     /* One hairline in the theme's own colours, so the panel reads as a card
-     * over the editor without a system frame around it. */
-    br = CreateSolidBrush(blend_rgb(h->theme.ui_fg, h->theme.ui_bg));
+     * over the editor without a system frame around it.  It is the last thing
+     * that says where the panel stops, so it is the one colour that is never
+     * allowed to come out the same as the surface behind it. */
+    br = CreateSolidBrush(edge);
     FrameRect(mem, &rc, br);
     DeleteObject(br);
 
@@ -602,8 +1052,13 @@ static void pal_preview(note_host *h)
 
 static void pal_refilter(note_host *h)
 {
+    const pal_mode *m = pal_cur(h);
+
     /* The complaint was about the text as it stood; it has just changed. */
     h->pal_msg[0] = 0;
+    /* And so has the stem Tab was walking. */
+    h->pal_cycle = -1;
+    if (m->retype) m->retype(h);
     note_palette_filter(&g_pal);
     h->pal_sel = 0;
     h->pal_top = 0;
@@ -712,6 +1167,13 @@ int pal_key(note_host *h, int vk)
     int shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
     int op    = -1;
 
+    /* Tab belongs to the mode that has something to complete, and to nothing
+     * else: there is no focus ring here for it to move around. */
+    if (vk == VK_TAB) {
+        if (pal_cur(h)->paths) pal_open_complete(h, shift ? -1 : 1);
+        return 1;
+    }
+
     /* The input line first: Up and Down belong to the list, everything else
      * that an edit field answers belongs to the text. */
     switch (vk) {
@@ -780,14 +1242,19 @@ void pal_open_mode(note_host *h, int mode)
     h->pal_msg[0] = 0;
 
     if (!h->pal) {
-        h->pal = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                                 L"notePalette", L"", WS_POPUP,
-                                 0, 0, 10, 10, h->wnd, NULL, h->inst, NULL);
+        h->pal = os_create_window(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                  N("notePalette"), N(""), WS_POPUP,
+                                  0, 0, 10, 10, h->wnd, NULL, h->inst, NULL);
         if (!h->pal) return;
     }
 
     /* The bar and the palette are two answers to the same question. */
     menubar_show(h, 0);
+
+    /* The list opens at its first row, not at whatever the pointer happens to
+     * be resting over: the panel appearing under a still mouse is the window
+     * moving, not the mouse. */
+    GetCursorPos(&g_pal_mouse);
 
     h->pal_mode = mode;
     m = pal_cur(h);
@@ -803,6 +1270,11 @@ void pal_open_mode(note_host *h, int mode)
     InvalidateRect(h->pal, NULL, FALSE);
 }
 
+void pal_open_path(note_host *h)
+{
+    pal_open_mode(h, PAL_MODE_OPEN);
+}
+
 void pal_show(note_host *h)
 {
     if (h->pal_open) return;
@@ -814,6 +1286,11 @@ void pal_show(note_host *h)
 void pal_open_rename(note_host *h)
 {
     pal_open_mode(h, PAL_MODE_RENAME);
+}
+
+void pal_open_run(note_host *h)
+{
+    pal_open_mode(h, PAL_MODE_RUN);
 }
 
 /* Dismissed rather than answered — a click elsewhere, the window losing
@@ -843,8 +1320,27 @@ LRESULT CALLBACK PaletteProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
+    /* A move that did not move is not a hover.
+     *
+     * Windows sends WM_MOUSEMOVE whenever the window under a pointer changes
+     * out from under it -- shown, moved, restacked -- and not only when the
+     * pointer itself has gone somewhere.  Previewing a theme does all of
+     * that: every arrow key repaints and relays out the frame, the panel
+     * comes back under a pointer that never moved, and the move that follows
+     * dragged the selection straight back to whatever row the pointer was
+     * resting on.  Down and Up looked dead for as long as the mouse happened
+     * to be over the list.  So the row under the pointer is taken only when
+     * the pointer has actually been somewhere new since the last time. */
     case WM_MOUSEMOVE: {
-        int row = pal_row_at(&g, (short)HIWORD(lp));
+        DWORD at = GetMessagePos();
+        int   row;
+
+        if ((short)LOWORD(at) == g_pal_mouse.x &&
+            (short)HIWORD(at) == g_pal_mouse.y) return 0;
+        g_pal_mouse.x = (short)LOWORD(at);
+        g_pal_mouse.y = (short)HIWORD(at);
+
+        row = pal_row_at(&g, (short)HIWORD(lp));
         if (row >= 0 && row != g.pal_sel) {
             g.pal_sel = row;
             InvalidateRect(wnd, NULL, FALSE);
@@ -867,6 +1363,6 @@ LRESULT CALLBACK PaletteProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    return DefWindowProcW(wnd, msg, wp, lp);
+    return os_defproc(wnd, msg, wp, lp);
 }
 
