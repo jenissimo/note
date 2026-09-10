@@ -8,15 +8,43 @@
  * Rows
  * ========================================================================== */
 
-void note_palette_reset(note_palette *p)
+void note_palette_reset_rows(note_palette *p)
 {
     p->nrows     = 0;
     p->pool_used = 0;
     p->nshown    = 0;
-    p->query[0]  = 0;
-    p->caret     = 0;
-    p->anchor    = 0;
-    p->has_undo  = 0;
+}
+
+void note_palette_reset(note_palette *p)
+{
+    note_palette_reset_rows(p);
+    p->query[0]    = 0;
+    p->caret       = 0;
+    p->anchor      = 0;
+    p->has_undo    = 0;
+    p->filter_from = 0;
+}
+
+void note_palette_filter_from(note_palette *p, int from)
+{
+    int len = n_len(p->query);
+    if (from < 0)   from = 0;
+    if (from > len) from = len;
+    p->filter_from = (short)from;
+}
+
+int note_palette_filter_at(const note_palette *p)
+{
+    int len = n_len(p->query);
+    return (p->filter_from > len) ? len : p->filter_from;
+}
+
+const nchar *note_palette_filter_text(const note_palette *p)
+{
+    int len = n_len(p->query);
+    int at  = p->filter_from;
+    if (at > len) at = len;
+    return p->query + at;
 }
 
 int note_palette_add(note_palette *p, unsigned id,
@@ -485,7 +513,7 @@ void note_palette_filter(note_palette *p)
     int i, n = 0;
 
     for (i = 0; i < p->nrows; i++) {
-        int s = score_of(p->rows[i].label, p->query);
+        int s = score_of(p->rows[i].label, note_palette_filter_text(p));
         int j;
 
         if (s < 0) continue;

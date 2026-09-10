@@ -78,16 +78,23 @@ const note_menu_item note_menu[] = {
     { 0,                     MI_POPUP, N("&File")                       },
     { CMD_FILE_NEW,          MI_ITEM,  N("&New Tab\tCtrl+N")            },
     { CMD_FILE_OPEN,         MI_ITEM,  N("&Open...\tCtrl+O")            },
+    { CMD_FILE_OPENPATH,     MI_ITEM,  N("Open &Path...\tCtrl+Shift+O")  },
     { CMD_FILE_SAVE,         MI_ITEM,  N("&Save\tCtrl+S")               },
     { CMD_FILE_SAVEAS,       MI_ITEM,  N("Save &As...\tCtrl+Shift+S")   },
     { CMD_FILE_RENAME,       MI_ITEM,  N("Rena&me...\tF2")              },
     { CMD_FILE_CLOSE,        MI_ITEM,  N("&Close Tab\tCtrl+W")          },
+    { 0,                     MI_SEP,   0                                },
+    { CMD_FILE_RUN,          MI_ITEM,  N("&Run Command...\tCtrl+R")     },
     { 0,                     MI_SEP,   0                                },
     { CMD_FILE_EXIT,         MI_ITEM,  N("E&xit")                       },
     /* Printing is rare enough that it costs more as two lines of every File
      * menu than it saves; the palette reaches it in four keystrokes. */
     { CMD_FILE_PAGESETUP,    MI_HIDDEN, N("Page Setup...")              },
     { CMD_FILE_PRINT,        MI_HIDDEN, N("Print...\tCtrl+P")           },
+    /* Walking the tabs is a key, not a menu item anyone reads -- but it is
+     * still a command, so the palette and the key sheet find it here. */
+    { CMD_TAB_NEXT,          MI_HIDDEN, N("Next Tab\tCtrl+Tab")          },
+    { CMD_TAB_PREV,          MI_HIDDEN, N("Previous Tab\tCtrl+Shift+Tab")},
     { 0,                     MI_END,   0                                },
 
     { 0,                     MI_POPUP, N("&Edit")                       },
@@ -118,9 +125,9 @@ const note_menu_item note_menu[] = {
     { 0,                     MI_END,   0                                },
 
     { 0,                     MI_POPUP, N("&View")                       },
-    { CMD_VIEW_LINENUM,      MI_CHECK, N("&Line Numbers")               },
-    { CMD_VIEW_SYNTAX,       MI_CHECK, N("Synta&x Highlighting")        },
-    { CMD_VIEW_STATUS,       MI_CHECK, N("&Status Bar")                 },
+    { CMD_VIEW_LINENUM,      MI_CHECK, N("&Line Numbers\tCtrl+Shift+N") },
+    { CMD_VIEW_SYNTAX,       MI_CHECK, N("Synta&x Highlighting\tCtrl+Shift+X") },
+    { CMD_VIEW_STATUS,       MI_CHECK, N("&Status Bar\tCtrl+Shift+B")   },
     { 0,                     MI_SEP,   0                                },
     { CMD_VIEW_THEME_SYSTEM, MI_RADIO, N("Theme: &System")              },
     { CMD_VIEW_THEME_LIGHT,  MI_RADIO, N("Theme: L&ight")               },
@@ -133,6 +140,7 @@ const note_menu_item note_menu[] = {
     { 0,                     MI_END,   0                                },
 
     { 0,                     MI_POPUP, N("&Help")                       },
+    { CMD_HELP_KEYS,         MI_ITEM,  N("&Keyboard Shortcuts\tF1")     },
     { CMD_HELP_ABOUT,        MI_ITEM,  N("&About note")                 },
     { 0,                     MI_END,   0                                },
 
@@ -153,6 +161,7 @@ const note_menu_item note_ctxmenu[] = {
 
 /* Virtual keys the core refers to by name; backends map these to their own. */
 #define NKEY_TAB   0x09
+#define NKEY_F1    0x70
 #define NKEY_F2    0x71
 #define NKEY_F3    0x72
 #define NKEY_F5    0x74
@@ -162,10 +171,12 @@ const note_menu_item note_ctxmenu[] = {
 const note_accel note_accels[] = {
     { CMD_FILE_NEW,       ACC_CTRL,             'N'        },
     { CMD_FILE_OPEN,      ACC_CTRL,             'O'        },
+    { CMD_FILE_OPENPATH,  ACC_CTRL | ACC_SHIFT, 'O'        },
     { CMD_FILE_SAVE,      ACC_CTRL,             'S'        },
     { CMD_FILE_SAVEAS,    ACC_CTRL | ACC_SHIFT, 'S'        },
     { CMD_FILE_CLOSE,     ACC_CTRL,             'W'        },
     { CMD_FILE_RENAME,    0,                    NKEY_F2    },
+    { CMD_FILE_RUN,       ACC_CTRL,             'R'        },
     { CMD_FILE_PRINT,     ACC_CTRL,             'P'        },
     { CMD_EDIT_UNDO,      ACC_CTRL,             'Z'        },
     { CMD_EDIT_REDO,      ACC_CTRL,             'Y'        },
@@ -181,7 +192,11 @@ const note_accel note_accels[] = {
     { CMD_VIEW_ZOOMIN,    ACC_CTRL,             NKEY_PLUS  },
     { CMD_VIEW_ZOOMOUT,   ACC_CTRL,             NKEY_MINUS },
     { CMD_VIEW_ZOOMRESET, ACC_CTRL,             '0'        },
-    { CMD_VIEW_PALETTE,   ACC_CTRL,             'K'        }
+    { CMD_VIEW_LINENUM,   ACC_CTRL | ACC_SHIFT, 'N'        },
+    { CMD_VIEW_SYNTAX,    ACC_CTRL | ACC_SHIFT, 'X'        },
+    { CMD_VIEW_STATUS,    ACC_CTRL | ACC_SHIFT, 'B'        },
+    { CMD_VIEW_PALETTE,   ACC_CTRL,             'K'        },
+    { CMD_HELP_KEYS,      0,                    NKEY_F1    }
 };
 
 const int note_accel_count = (int)(sizeof(note_accels) / sizeof(note_accels[0]));
@@ -501,7 +516,15 @@ int note_load(note_app *a, int doc, const nchar *path)
     d = &a->docs[doc];
 
     if (!a->ops->file_read(a->host, path, &bytes, &len)) {
-        a->ops->message(a->host, N("Cannot open that file."), N("note"));
+        /* Silent while the session is coming back.  Restoring is not a request
+         * to open anything: it happens before the window is shown, so the box
+         * comes up over nothing, modal, with the editor invisible behind it --
+         * launching note with a session naming a file that had been deleted
+         * since put up "Cannot open that file." and no window at all until it
+         * was found and dismissed.  A user who asked for this file by name is
+         * still told; note_session_restore() drops the tab instead. */
+        if (!a->restoring)
+            a->ops->message(a->host, N("Cannot open that file."), N("note"));
         return 0;
     }
 
@@ -1013,6 +1036,15 @@ void note_session_save(note_app *a)
         n_cat(idx, N("\ntheme = "), cap);
         n_cat(idx, note_theme_get(a->theme_index)->name, cap);
     }
+
+    /* And the chrome, for the same reason: a status bar that comes back every
+     * time it is dismissed has not really been dismissed.  One line of four
+     * flags rather than four keys, because they are read and written
+     * together. */
+    n_cat(idx, N("\nview = "), cap);
+    n_utoa((unsigned)((a->wrap     ? 1 : 0) | (a->status   ? 2 : 0) |
+                      (a->linenums ? 4 : 0) | (a->syntax   ? 8 : 0)), num);
+    n_cat(idx, num, cap);
     n_cat(idx, N("\n"), cap);
 
     for (i = 0; i < a->ndocs; i++) {
@@ -1078,7 +1110,7 @@ int note_session_restore(note_app *a)
     nchar *text;
     const unsigned char *bp;
     const nchar *p;
-    int enc, cap, restored = 0, active = 0, styled = 0;
+    int enc, cap, restored = 0, active = 0, styled = 0, viewed = 0, dropped = 0;
 
     if (!NOTE_ENABLE_SESSION) return 0;
 
@@ -1112,6 +1144,18 @@ int note_session_restore(note_app *a)
             /* Matched by name: indices shift as definitions load. */
             a->theme_index = note_theme_find(v);
             styled = 1;
+            continue;
+        }
+        if (n_eq(key, N("view"))) {
+            unsigned f = n_atou(&v);
+            a->wrap     = (f & 1) ? 1 : 0;
+            a->status   = (f & 2) ? 1 : 0;
+            a->linenums = (f & 4) ? 1 : 0;
+            a->syntax   = (f & 8) ? 1 : 0;
+            /* Before any document is made: an editor reads a->wrap as it is
+             * created, so setting the flags here is enough for the tabs and
+             * only the chrome has to be told afterwards. */
+            viewed = 1;
             continue;
         }
         if (!n_eq(key, N("doc"))) continue;
@@ -1153,7 +1197,30 @@ int note_session_restore(note_app *a)
                 a->ops->set_modified(a->host, doc, 1);
             }
         } else if (a->docs[doc].path[0]) {
-            note_load(a, doc, a->docs[doc].path);
+            /* Gone since last run -- deleted, renamed, or on a drive that is
+             * not mounted this time.  The tab is dropped and the rest of the
+             * session comes back around it, which is what every editor that
+             * restores tabs does: a file that no longer exists has nothing to
+             * show, and a session is a record of what was open, not a promise
+             * that it still is.  note_load() has already been quiet about it
+             * (a->restoring), so nothing is waiting for a click.
+             *
+             * Dropped by hand rather than through note_close_doc(): this doc
+             * is the one note_new_doc() has just appended, so it is the last
+             * one and unwinding is a decrement -- and note_close_doc() would
+             * make a fresh Untitled the moment the last tab went, which is the
+             * one the caller makes for itself when nothing is restored. */
+            if (!note_load(a, doc, a->docs[doc].path)) {
+                a->ops->tab_destroy(a->host, doc);
+                a->ndocs--;
+                /* "active" is written before the documents and so is already
+                 * read: it indexes the list as it was saved, and a tab dropped
+                 * ahead of it slides it one to the left.  Without this the
+                 * wrong document comes up selected. */
+                if (restored + dropped < active) active--;
+                dropped++;
+                continue;
+            }
         }
 
         refresh_tab(a, doc);
@@ -1164,6 +1231,11 @@ int note_session_restore(note_app *a)
     a->restoring = 0;
 
     if (styled) note_apply_theme(a);
+    if (viewed) {
+        a->ops->show_status (a->host, a->status);
+        a->ops->set_linenums(a->host, a->linenums);
+        a->ops->set_wrap    (a->host, a->wrap);
+    }
 
     if (restored) {
         if (active < 0 || active >= a->ndocs) active = 0;
@@ -1235,6 +1307,59 @@ void note_set_theme_index(note_app *a, int idx)
 {
     a->theme_index = (idx >= 0 && idx < note_theme_count()) ? idx : -1;
     note_apply_theme(a);
+}
+
+/* ==========================================================================
+ * The key sheet
+ *
+ * Read off the same two tables the menus and the accelerators are built from,
+ * so a binding that changes in one place changes on the sheet, and one that is
+ * documented but does not exist cannot happen.  Every string is borrowed from
+ * those tables; nothing here is allocated or copied.
+ * ========================================================================== */
+
+/* What is left over: keys that are gestures rather than commands, so they are
+ * in neither table and would otherwise go unmentioned anywhere. */
+static const note_help_row note_gestures[] = {
+    { N("Anywhere"), N("Command palette"),       N("Ctrl+K")       },
+    { 0,             N("Go to open tab"),        N("Shift, Shift") },
+    { 0,             N("Menu bar"),              N("Alt")          },
+    { 0,             N("Complete a path"),       N("Tab")          },
+    { 0,             N("Put away an overlay"),   N("Esc")          },
+    { 0, 0, 0 }
+};
+
+int note_help_fill(note_help_row *rows, int cap)
+{
+    const note_menu_item *it = note_menu;
+    const nchar *group;
+    int n = 0, i;
+
+    /* The same walk note_palette_commands() makes: a run of popups, each
+     * closed by an MI_END. */
+    while (it->kind == MI_POPUP) {
+        group = it->label;
+
+        for (it++; it->kind != MI_END; it++) {
+            const nchar *k = it->label;
+
+            if (it->kind == MI_SEP || !it->id || !k) continue;
+
+            while (*k && *k != (nchar)'\t') k++;
+            if (!*k) continue;            /* no key of its own to show */
+
+            if (n >= cap) return n;
+            rows[n].group = group;        /* only the first row of a menu */
+            rows[n].label = it->label;
+            rows[n].keys  = k + 1;
+            n++;
+            group = 0;
+        }
+        it++;                             /* past the popup's MI_END */
+    }
+
+    for (i = 0; note_gestures[i].keys && n < cap; i++) rows[n++] = note_gestures[i];
+    return n;
 }
 
 /* ==========================================================================
@@ -1318,6 +1443,16 @@ int note_command(note_app *a, int cmd)
             note_close_doc(a, a->active);
             note_session_save(a);
         }
+        return 1;
+
+    /* The path is typed rather than picked, so this is a question the
+     * backend asks on whatever surface it asks questions on. */
+    case CMD_FILE_OPENPATH:
+        o->pick(h, PICK_PATH);
+        return 1;
+
+    case CMD_FILE_RUN:
+        o->pick(h, PICK_RUN);
         return 1;
 
     case CMD_FILE_PAGESETUP: o->dlg_pagesetup(h); return 1;
@@ -1416,6 +1551,10 @@ int note_command(note_app *a, int cmd)
     case CMD_VIEW_ZOOMRESET:
         a->zoom = 100;
         o->set_zoom(h, a->zoom);
+        return 1;
+
+    case CMD_HELP_KEYS:
+        o->show_help(h);
         return 1;
 
     case CMD_HELP_ABOUT:

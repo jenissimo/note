@@ -79,6 +79,14 @@ int note_conf_bool(const nchar *v)
            v[0] == (nchar)'o' || v[0] == (nchar)'O';   /* on */
 }
 
+/* Only a theme says #RRGGBB, so a build that never reads one at run time has
+ * no caller for this and no reason to carry it -- and on the two targets that
+ * is true of, three hundred and forty bytes of dead 6502 is not a rounding
+ * error.  See NOTE_THEME_PARSE in note_config.h, which is this question and
+ * not the question of whether there is a registry: the 16-bit MS-DOS build
+ * parses themes and has no registry. */
+#if NOTE_THEME_PARSE
+
 static int hex_digit(nchar c)
 {
     if (c >= (nchar)'0' && c <= (nchar)'9') return c - (nchar)'0';
@@ -87,28 +95,36 @@ static int hex_digit(nchar c)
     return -1;
 }
 
-unsigned note_conf_color(const nchar *v)
+note_color note_conf_color(const nchar *v)
 {
-    unsigned c = 0;
+    note_color c = 0;
     int i, d, n = 0;
 
     if (*v == (nchar)'#') v++;
     for (i = 0; i < 6 && v[i]; i++) {
         d = hex_digit(v[i]);
         if (d < 0) break;
-        c = (c << 4) | (unsigned)d;
+        c = (c << 4) | (note_color)d;
         n++;
     }
     if (n == 3) {   /* #abc -> #aabbcc */
-        unsigned r = (c >> 8) & 0xF, g = (c >> 4) & 0xF, b = c & 0xF;
+        note_color r = (c >> 8) & 0xF, g = (c >> 4) & 0xF, b = c & 0xF;
         c = (r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b;
     }
     return c;
 }
 
+#endif  /* NOTE_THEME_PARSE */
+
+/* The distance from 'A' to 'a' is 32 in ASCII and 128 in PETSCII, so the gap
+ * is computed from the literals rather than written down.  cc65 maps both to
+ * the target's own character set, which makes this correct on a C64 without
+ * knowing anything about a C64. */
 static nchar lower(nchar c)
 {
-    return (c >= (nchar)'A' && c <= (nchar)'Z') ? (nchar)(c + 32) : c;
+    return (c >= (nchar)'A' && c <= (nchar)'Z')
+         ? (nchar)(c - (nchar)'A' + (nchar)'a')
+         : c;
 }
 
 int note_word_in_list(const nchar *list, const nchar *word, int len, int nocase)

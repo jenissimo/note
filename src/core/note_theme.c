@@ -42,8 +42,38 @@ static const char kThemeDark[] = (
     "preproc    = #C586C0\n"
     "operator   = #D4D4D4\n");
 
-/* The fallback pair, used when no pack is found beside the executable. */
-static const char *const note_builtin_themes[] = { kThemeLight, kThemeDark, 0 };
+/* A machine's own screen, written down the way every other theme is.
+ *
+ * The colours are the VIC-II's, measured rather than idealised -- the same set
+ * note_reduce.c carries as note_pal_c64 -- so reducing this theme onto that
+ * palette gives back the entries it was written from, and reducing it onto a
+ * CGA card gives the nearest thing a PC can say.  It is here rather than in a
+ * console backend because a theme is a theme: the retro ports used to keep
+ * their own table of hardware indices, and this is the definition that table
+ * turned out to be. */
+static const char kThemeCommodore[] = (
+    "name = Commodore 64\n"
+    "dark = yes\n"
+    "background = #352879\n"
+    "foreground = #6C5EB5\n"
+    "gutter_bg  = #352879\n"
+    "gutter_fg  = #6C6C6C\n"
+    "selection  = #6C5EB5\n"
+    "caret      = #6C5EB5\n"
+    "ui_bg      = #6C5EB5\n"
+    "ui_fg      = #352879\n"
+    "keyword    = #FFFFFF\n"
+    "type       = #70A4B2\n"
+    "comment    = #6C6C6C\n"
+    "string     = #9AD284\n"
+    "number     = #B8C76F\n"
+    "preproc    = #6F4F25\n"
+    "operator   = #959595\n");
+
+/* The fallback set, used when no pack is found beside the executable. */
+static const char *const note_builtin_themes[] = {
+    kThemeLight, kThemeDark, kThemeCommodore, 0
+};
 
 /* ==========================================================================
  * Registry
@@ -94,6 +124,7 @@ int note_theme_add(note_arena *ar, const nchar *text)
         else if (n_eq(key, N("gutter_bg")))  T.gutter_bg = note_conf_color(val);
         else if (n_eq(key, N("gutter_fg")))  T.gutter_fg = note_conf_color(val);
         else if (n_eq(key, N("selection")))  T.sel_bg    = note_conf_color(val);
+        else if (n_eq(key, N("caret")))      T.caret     = note_conf_color(val);
         else if (n_eq(key, N("ui_bg")))      T.ui_bg     = note_conf_color(val);
         else if (n_eq(key, N("ui_fg")))      T.ui_fg     = note_conf_color(val);
         else if (n_eq(key, N("keyword")))    T.tok[TOK_KEYWORD] = note_conf_color(val);
@@ -112,6 +143,7 @@ int note_theme_add(note_arena *ar, const nchar *text)
     T.tok[TOK_TEXT] = T.fg;
     for (i = 1; i < TOK_COUNT; i++)
         if (!T.tok[i]) T.tok[i] = T.fg;
+    if (!T.caret) T.caret = T.fg;
 
     for (i = 0; i < g_nthemes; i++)
         if (g_themes[i].name && n_eq(g_themes[i].name, T.name)) { slot = i; break; }

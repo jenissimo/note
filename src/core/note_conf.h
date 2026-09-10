@@ -34,9 +34,14 @@ const nchar *note_arena_put(note_arena *a, const nchar *s, int len);
  * Returns 1 while a pair was produced, 0 at end of text. */
 int note_conf_next(const nchar **p, nchar *key, int kcap, nchar *val, int vcap);
 
+/* A colour is 24 bits, which does not fit an `int` the core is not allowed to
+ * assume is wider than 16.  On a desktop this is the same type it always was;
+ * on cc65 it is the difference between a palette and nonsense. */
+typedef unsigned long note_color;
+
 /* Value helpers. */
-int      note_conf_bool (const nchar *v);            /* yes/true/on/1 */
-unsigned note_conf_color(const nchar *v);            /* "#RRGGBB" -> 0xRRGGBB */
+int        note_conf_bool (const nchar *v);          /* yes/true/on/1 */
+note_color note_conf_color(const nchar *v);          /* "#RRGGBB" -> 0xRRGGBB */
 
 /* Is `word` (length `len`) present in a space-separated list? */
 int note_word_in_list(const nchar *list, const nchar *word, int len, int nocase);

@@ -19,14 +19,21 @@
 typedef struct {
     const nchar *name;
     int          dark;          /* 1 if this palette is a dark one */
-    unsigned     bg;            /* editor background   */
-    unsigned     fg;            /* default text        */
-    unsigned     gutter_bg;
-    unsigned     gutter_fg;
-    unsigned     sel_bg;
-    unsigned     ui_bg;         /* tab strip / status bar */
-    unsigned     ui_fg;
-    unsigned     tok[TOK_COUNT];
+    note_color   bg;            /* editor background   */
+    note_color   fg;            /* default text        */
+    note_color   gutter_bg;
+    note_color   gutter_fg;
+    note_color   sel_bg;
+    /* The block the caret fills a cell with.  A backend that draws a thin
+     * line uses it as the line's colour; the retro ports draw a reversed
+     * cell, so the block is this colour and the character it swallows is
+     * punched out of it in the background colour.  Defaults to `fg` when a
+     * theme does not name one, which is what the console themes already do
+     * in practice. */
+    note_color   caret;
+    note_color   ui_bg;         /* tab strip / status bar */
+    note_color   ui_fg;
+    note_color   tok[TOK_COUNT];
 } note_theme;
 
 void              note_theme_init(note_arena *ar);

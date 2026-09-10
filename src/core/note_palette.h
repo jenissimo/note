@@ -41,6 +41,11 @@ typedef struct {
      * selection and one level of undo live here, where every backend gets
      * the same editing behaviour rather than half of it. */
     nchar        query[NOTE_PALETTE_QUERY];
+    /* Where the part of the query that filters begins.  Zero for every mode
+     * whose query is a filter and nothing else; a mode whose query is a path
+     * moves it past the last separator, so that typing a folder narrows the
+     * names inside it instead of matching them against the whole path. */
+    short        filter_from;
     short        caret;       /* insertion point, in nchars               */
     short        anchor;      /* the other end of the selection           */
     nchar        undo[NOTE_PALETTE_QUERY];
@@ -50,6 +55,10 @@ typedef struct {
 
 /* Empties the rows, the pool and the query. */
 void note_palette_reset(note_palette *p);
+
+/* The same, but leaves the query where it is — for a mode whose rows are
+ * recomputed from what has been typed, on every keystroke. */
+void note_palette_reset_rows(note_palette *p);
 
 /* Adds a row.  note_palette_add borrows the strings — they must outlive the
  * palette — while note_palette_add_copy takes its own copy in the pool.
@@ -61,6 +70,15 @@ int  note_palette_add_copy(note_palette *p, unsigned id,
 
 /* Fills the rows with every command in note_menu and clears the query. */
 void note_palette_commands(note_palette *p);
+
+/* Ranks on the query from `from` onwards rather than on all of it, and keeps
+ * doing so until the next reset.  See `filter_from`. */
+void note_palette_filter_from(note_palette *p, int from);
+/* What the ranking is actually matching against — the query, or its tail. */
+const nchar *note_palette_filter_text(const note_palette *p);
+/* And where that tail begins, for a backend drawing the two halves of a path
+ * differently. */
+int          note_palette_filter_at(const note_palette *p);
 
 /* Re-ranks against the current query: rows whose label contains it as a
  * subsequence, best match first.  An empty query keeps every row in the

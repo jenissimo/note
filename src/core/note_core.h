@@ -16,15 +16,27 @@
  * nchar — the character type the native text control speaks.
  * Windows controls are UTF-16, GTK/AppKit are UTF-8, so the core is written
  * once against nchar and N("literal") rather than picking a side.
+ *
+ * Which side is a property of the backend, not of the operating system: a
+ * Windows 95 build has to speak bytes, because 9x has almost no W entry
+ * points to call, and it is still Windows.  So NOTE_NCHAR_UTF16 is an input
+ * a build may set on the command line, and _WIN32 only supplies the default
+ * for a build that says nothing.
  * -------------------------------------------------------------------------- */
-#ifdef _WIN32
+#ifndef NOTE_NCHAR_UTF16
+  #ifdef _WIN32
+    #define NOTE_NCHAR_UTF16 1
+  #else
+    #define NOTE_NCHAR_UTF16 0
+  #endif
+#endif
+
+#if NOTE_NCHAR_UTF16
   typedef unsigned short nchar;
   #define N(s) L##s
-  #define NOTE_NCHAR_UTF16 1
 #else
   typedef char nchar;
   #define N(s) s
-  #define NOTE_NCHAR_UTF16 0
 #endif
 
 /* --------------------------------------------------------------------------
@@ -47,6 +59,14 @@ enum {
      * the menu but at the end of the block here, so adding it does not
      * renumber the ids a build already in flight is using. */
     CMD_FILE_RENAME,
+    /* Opening a file by typing its path rather than by hunting for it in the
+     * system dialog.  Appended for the same reason as CMD_FILE_RENAME: a new
+     * id at the end of the block renumbers nothing. */
+    CMD_FILE_OPENPATH,
+    /* Running a command in the folder of the file being edited: the smallest
+     * step from an editor towards somewhere you can work.  Appended for the
+     * same reason as the two above. */
+    CMD_FILE_RUN,
 
     CMD_EDIT_UNDO = 0x200,
     CMD_EDIT_REDO,
@@ -81,7 +101,8 @@ enum {
     CMD_TAB_NEXT = 0x480,
     CMD_TAB_PREV,
 
-    CMD_HELP_ABOUT = 0x500
+    CMD_HELP_ABOUT = 0x500,
+    CMD_HELP_KEYS
 };
 
 /* Menu model ------------------------------------------------------------- */
@@ -145,7 +166,7 @@ enum { ASK_YES = 1, ASK_NO = 0, ASK_CANCEL = -1 };
  * backend applies the result itself, which is what lets one backend answer
  * with a dialog and another — as the Win32 one does — with a mode of its
  * command palette. */
-enum { PICK_THEME = 0, PICK_FONT, PICK_LINE, PICK_RENAME };
+enum { PICK_THEME = 0, PICK_FONT, PICK_LINE, PICK_RENAME, PICK_PATH, PICK_RUN };
 
 typedef struct note_host note_host;   /* opaque, owned by the backend */
 typedef struct note_app  note_app;
@@ -249,6 +270,10 @@ typedef struct {
      * is why" without a modal box, which is what a mode that must stay open
      * to be corrected needs. */
     void  (*set_hint)   (note_host *, const nchar *text);
+    /* Puts the key sheet on screen.  The core knows every binding — see
+     * note_help_fill() — but not how this platform wants to show a panel, so
+     * it hands over the moment and nothing else. */
+    void  (*show_help)  (note_host *);
     void  (*quit)       (note_host *);
 } note_host_ops;
 
@@ -307,6 +332,26 @@ void note_apply_theme(note_app *a);
  * How a backend asked the user is its own business; this is the answer. */
 void note_set_theme_index(note_app *a, int idx);
 void note_doc_title  (note_app *a, int doc, nchar *buf, int cap);
+
+/* --------------------------------------------------------------------------
+ * The key sheet.
+ *
+ * Read off note_menu and note_accels rather than written out a second time:
+ * a shortcut that changes in the table changes on the sheet, and one that is
+ * only ever documented cannot exist.  Every string is borrowed from those
+ * tables, so a row outlives the call and none of it is allocated.
+ *
+ * `label` is a menu label as the table spells it — mnemonic markers and the
+ * tab before the key are still in it, because stripping them is a matter of
+ * how a platform draws menus.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    const nchar *group;   /* names a new section; NULL continues the last */
+    const nchar *label;
+    const nchar *keys;
+} note_help_row;
+
+int note_help_fill(note_help_row *rows, int cap);
 
 /* Definition files: built-ins first, then <exe>/ and the per-user state dir,
  * each layer overriding the one before it by name. */
