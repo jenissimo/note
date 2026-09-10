@@ -5,10 +5,10 @@
 # here comes from the file itself or from the linker's map, never from an
 # estimate.
 #
-#   powershell -ExecutionPolicy Bypass -File tools\size_report.ps1 [build\note.exe]
+#   powershell -ExecutionPolicy Bypass -File tools\size_report.ps1 [build\win32\note.exe]
 
 param(
-    [string]$Exe = "build\note.exe",
+    [string]$Exe = "build\win32\note.exe",
     [int]$Budget = 65536
 )
 

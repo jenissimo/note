@@ -1,4 +1,4 @@
-/* note.rc — the resources compiled into note.exe.
+﻿/* note.rc — the resources compiled into note.exe.
  *
  * The icon has to be a resource rather than something loaded at runtime:
  * Explorer draws the icon for an executable by reading RT_GROUP_ICON out of
@@ -14,14 +14,20 @@
 
 IDI_NOTE ICON "..\\assets\\note.ico"
 
-/* The curated language and theme packs, so note.exe is a complete editor on
- * its own rather than three files that have to travel together.  They are
- * compiled by tools\compress_packs.ps1 into build\, and build.bat defines
- * HAVE_PACKS only once both exist — without them the executable still works,
- * falling back to the definitions compiled into the C. */
+/* The curated language pack, so note.exe is a complete editor on its own
+ * rather than two files that have to travel together.  It is compiled by
+ * tools\compress_packs.ps1 into the build directory, which build.bat passes
+ * to rc as an include path -- so it is named here without one, and a build
+ * sent elsewhere by NOTE_OUT still finds its own.  build.bat defines
+ * HAVE_PACKS only once it exists — without it the executable still runs,
+ * with no languages but whatever it finds on disk beside it.
+ *
+ * The curated theme pack is not here.  It is appended to the executable after
+ * the link, because the 16-bit MS-DOS editor in this file's MZ stub reads it
+ * too and cannot reach a PE resource; see build.bat and h_overlay_pack() in
+ * src\platform\win32\win32_host.c. */
 #ifdef HAVE_PACKS
-IDR_CORE_SYNTAX RT_NOTEPACK "..\\build\\core.syntax.lz"
-IDR_CORE_THEMES RT_NOTEPACK "..\\build\\core.themes.lz"
+IDR_CORE_SYNTAX RT_NOTEPACK "core.syntax.lz"
 #endif
 
 /* The version block is what the file's Properties page and most installers
