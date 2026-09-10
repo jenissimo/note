@@ -7,29 +7,26 @@
 
 #include "note_win32.h"
 #include "../../note_res.h"
+#include "../../core/note_pack.h"
 
 void pal_open_rename(note_host *h);      /* win32_palette.c */
+void pal_open_run(note_host *h);         /* win32_palette.c */
 
 static int h_time_date(note_host *h, nchar *buf, int cap)
 {
     SYSTEMTIME st;
-    int n;
     (void)h;
     GetLocalTime(&st);
-    n = GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &st, NULL, (LPWSTR)buf, cap);
-    if (n <= 0) return 0;
-    buf[n - 1] = (nchar)' ';
-    return GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &st, NULL,
-                          (LPWSTR)(buf + n), cap - n) > 0;
+    return os_time_date(&st, buf, cap);
 }
 
 int h_system_dark(note_host *h)
 {
-    DWORD v = 1, cb = sizeof(v);
+    DWORD v = 1;
     (void)h;
-    if (RegGetValueW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &v, &cb) != ERROR_SUCCESS)
+    if (!os_reg_dword(HKEY_CURRENT_USER,
+            N("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            N("AppsUseLightTheme"), &v))
         return 0;
     return v ? 0 : 1;
 }
@@ -38,7 +35,7 @@ static int h_state_dir(note_host *h, nchar *buf, int cap)
 {
     DWORD n;
     (void)h;
-    n = GetEnvironmentVariableW(L"LOCALAPPDATA", (LPWSTR)buf, (DWORD)cap);
+    n = os_env(N("LOCALAPPDATA"), buf, cap);
     if (!n || n >= (DWORD)cap) return 0;
     n_cat(buf, N("\\note"), cap);
     return 1;
@@ -46,7 +43,7 @@ static int h_state_dir(note_host *h, nchar *buf, int cap)
 
 static int h_exe_dir(note_host *h, nchar *buf, int cap)
 {
-    DWORD n = GetModuleFileNameW(h->inst, (LPWSTR)buf, (DWORD)cap);
+    DWORD n = os_module_file_name(h->inst, buf, cap);
     int i;
     if (!n || n >= (DWORD)cap) return 0;
     for (i = (int)n; i > 0; i--)
@@ -57,45 +54,42 @@ static int h_exe_dir(note_host *h, nchar *buf, int cap)
 static int h_dir_make(note_host *h, const nchar *dir)
 {
     (void)h;
-    return CreateDirectoryW((LPCWSTR)dir, NULL) ||
-           GetLastError() == ERROR_ALREADY_EXISTS;
+    return os_create_dir(dir) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
 static int h_dir_list(note_host *h, const nchar *dir, const nchar *ext,
                       nchar *out, int cap)
 {
-    WCHAR pattern[NOTE_PATH_MAX];
-    WIN32_FIND_DATAW fd;
-    HANDLE find;
+    nchar pattern[NOTE_PATH_MAX];
+    os_find f;
     int used = 0, count = 0;
     (void)h;
 
     pattern[0] = 0;
-    n_cat((nchar *)pattern, dir, NOTE_PATH_MAX);
-    n_cat((nchar *)pattern, N("\\*."), NOTE_PATH_MAX);
-    n_cat((nchar *)pattern, ext, NOTE_PATH_MAX);
+    n_cat(pattern, dir, NOTE_PATH_MAX);
+    n_cat(pattern, N("\\*."), NOTE_PATH_MAX);
+    n_cat(pattern, ext, NOTE_PATH_MAX);
 
-    find = FindFirstFileW(pattern, &fd);
-    if (find == INVALID_HANDLE_VALUE) { out[0] = 0; return 0; }
+    if (!os_find_open(pattern, &f)) { out[0] = 0; return 0; }
 
     do {
         nchar full[NOTE_PATH_MAX];
         int len;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (f.attrs & FILE_ATTRIBUTE_DIRECTORY) continue;
 
         full[0] = 0;
         n_cat(full, dir, NOTE_PATH_MAX);
         n_cat(full, N("\\"), NOTE_PATH_MAX);
-        n_cat(full, (const nchar *)fd.cFileName, NOTE_PATH_MAX);
+        n_cat(full, f.name, NOTE_PATH_MAX);
 
         len = n_len(full);
         if (used + len + 2 >= cap) break;
         n_copy(out + used, full, len + 1);
         used += len + 1;
         count++;
-    } while (FindNextFileW(find, &fd));
+    } while (os_find_step(&f));
 
-    FindClose(find);
+    os_find_close(&f);
     out[used] = 0;
     return count;
 }
@@ -107,8 +101,7 @@ static int h_file_read(note_host *h, const nchar *path,
     DWORD size, got = 0;
     unsigned char *p;
 
-    f = CreateFileW((LPCWSTR)path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    f = os_create_file(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     if (f == INVALID_HANDLE_VALUE) return 0;
 
     size = GetFileSize(f, NULL);
@@ -136,8 +129,7 @@ static int h_file_write(note_host *h, const nchar *path,
     BOOL   ok;
     (void)h;
 
-    f = CreateFileW((LPCWSTR)path, GENERIC_WRITE, 0, NULL,
-                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    f = os_create_file(path, GENERIC_WRITE, 0, CREATE_ALWAYS);
     if (f == INVALID_HANDLE_VALUE) return 0;
 
     ok = len ? WriteFile(f, bytes, len, &wrote, NULL) : TRUE;
@@ -147,88 +139,150 @@ static int h_file_write(note_host *h, const nchar *path,
 
 /* ---- the definition packs compiled into the executable -------------------
  *
- * They are stored LZMS-compressed, each behind a four-byte uncompressed size,
- * because a pack is repetitive text and compresses to under a fifth.  The
- * decompressor is Windows' own, from Cabinet.dll, so note carries no
- * decompression code of its own — the whole cost on this side is one call.
+ * These used to be LZMS, decompressed by Cabinet.dll, which meant note shipped
+ * no decompression code at all.  That was a good trade until it was run on
+ * Windows 95: the API arrived in Windows 8, the call is simply not there, and
+ * since no languages are compiled in any more the editor came up with no
+ * highlighting whatsoever while carrying 19 KB of definitions it could not
+ * read.  The format is note's own now -- see src\core\note_pack.h -- so this
+ * path has nothing version-dependent left in it and no library to look up.
  *
- * Resolved at run time rather than imported: an executable that fails to load
- * because a system DLL is missing is worse than one that quietly falls back to
- * the definitions compiled into the C.
+ * The whole pack is materialised here because the registry is what the theme
+ * and language pickers list; a backend with no pickers wants
+ * note_pack_find() instead, which reads one definition and never holds the
+ * rest.
+ *
+ * TWO PLACES IN THE FILE, AND WHY THE THEMES ARE NOT IN .rsrc
+ *
+ * The syntax pack is a PE resource.  The theme catalogue is not: it is
+ * appended to the end of the executable, past the last section, and read by
+ * opening the file.  That is not a preference, it is the only region both
+ * halves of this file can reach.  note.exe is a dual binary -- the PE for
+ * Windows and, in the MZ stub at the front of it, a 16-bit real-mode editor
+ * for MS-DOS -- and a real-mode program cannot walk a PE resource directory,
+ * nor run the loader that would expand one for it.  What it can do is open
+ * its own executable and seek, so an overlay is what the two can agree on.
+ *
+ * One physical copy, and this is the half with the easier job of finding it.
+ * Both halves use the same rule: the last NPK1 in the last 64 KB of the file.
+ * The last, because four bytes of magic occur by chance in a couple of
+ * hundred kilobytes of code and the build appends this after everything else.
  * -------------------------------------------------------------------------- */
 
-#define COMPRESS_ALGORITHM_LZMS 5
+/* The appended blob, moved to the front of its own allocation so the caller
+ * has one pointer to free.  Zero if this executable carries no overlay, which
+ * is what a build without tools/compress_packs.ps1 produces and is not an
+ * error -- the built-in light and dark palettes are still a theme list. */
+static unsigned char *h_overlay_pack(note_host *h, DWORD *len)
+{
+    nchar  path[NOTE_PATH_MAX];
+    HANDLE f;
+    DWORD  size, start, want, got = 0, i;
+    long   found = -1;
+    unsigned char *tail;
 
-typedef BOOL (WINAPI *PFN_CREATEDECOMP)(DWORD, void *, HANDLE *);
-typedef BOOL (WINAPI *PFN_DECOMPRESS)(HANDLE, const void *, SIZE_T,
-                                      void *, SIZE_T, SIZE_T *);
-typedef BOOL (WINAPI *PFN_CLOSEDECOMP)(HANDLE);
+    *len = 0;
+    if (!os_module_file_name(h->inst, path, NOTE_PATH_MAX)) return 0;
+
+    f = os_create_file(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+
+    size = GetFileSize(f, NULL);
+    if (size == INVALID_FILE_SIZE || size <= NOTE_PACK_HEADER) {
+        CloseHandle(f);
+        return 0;
+    }
+
+    /* The same 64 KB window the MS-DOS half scans, so the two cannot
+     * disagree about which NPK1 is the last one. */
+    start = size > 65536uL ? size - 65536uL : 0uL;
+    want  = size - start;
+
+    tail = (unsigned char *)h_alloc(h, want);
+    if (!tail) { CloseHandle(f); return 0; }
+
+    SetFilePointer(f, (LONG)start, NULL, FILE_BEGIN);
+    if (!ReadFile(f, tail, want, &got, NULL)) {
+        h_free(h, tail); CloseHandle(f); return 0;
+    }
+    CloseHandle(f);
+
+    for (i = 0; i + NOTE_PACK_HEADER <= got; i++)
+        if (tail[i] == 0x4E && tail[i + 1] == 0x50 &&
+            tail[i + 2] == 0x4B && tail[i + 3] == 0x31) found = (long)i;
+
+    if (found < 0) { h_free(h, tail); return 0; }
+
+    got -= (DWORD)found;
+    for (i = 0; i < got; i++) tail[i] = tail[i + (DWORD)found];
+    *len = got;
+    return tail;
+}
 
 static int h_embedded_pack(note_host *h, int which, nchar **out)
 {
-    static PFN_CREATEDECOMP create;
-    static PFN_DECOMPRESS   decomp;
-    static PFN_CLOSEDECOMP  closed;
-    static int              probed;
-
-    HRSRC   res;
-    HGLOBAL blob;
+    note_pack *z;
     const unsigned char *p;
-    DWORD   res_size, raw_size;
-    HANDLE  dec = NULL;
-    unsigned char *raw;
+    unsigned char *owned = 0;
+    DWORD   res_size = 0;
+    unsigned long raw_size, i;
     nchar  *text;
-    SIZE_T  used = 0;
-    int     cap;
 
     *out = 0;
 
-    if (!probed) {
-        HMODULE cab = LoadLibraryW(L"Cabinet.dll");
-        probed = 1;
-        if (cab) {
-            create = (PFN_CREATEDECOMP)GetProcAddress(cab, "CreateDecompressor");
-            decomp = (PFN_DECOMPRESS)  GetProcAddress(cab, "Decompress");
-            closed = (PFN_CLOSEDECOMP) GetProcAddress(cab, "CloseDecompressor");
-        }
+    if (which) {
+        /* Themes: the overlay, which is the curated pack and the only copy
+         * of it in the file.  A themes.pack found on disk afterwards adds
+         * the rest of the catalogue and overrides these by name. */
+        owned = h_overlay_pack(h, &res_size);
+        p = owned;
+    } else {
+        HRSRC   res;
+        HGLOBAL blob;
+
+        res = os_find_resource(h->inst, IDR_CORE_SYNTAX, RT_NOTEPACK);
+        if (!res) return 0;
+        res_size = SizeofResource(h->inst, res);
+        blob     = LoadResource(h->inst, res);
+        if (!blob) return 0;
+        p = (const unsigned char *)LockResource(blob);
     }
-    if (!create || !decomp) return 0;
-
-    res = FindResourceW(h->inst,
-                        MAKEINTRESOURCEW(which ? IDR_CORE_THEMES : IDR_CORE_SYNTAX),
-                        MAKEINTRESOURCEW(RT_NOTEPACK));
-    if (!res) return 0;
-
-    res_size = SizeofResource(h->inst, res);
-    blob     = LoadResource(h->inst, res);
-    if (!blob || res_size <= 4) return 0;
-    p = (const unsigned char *)LockResource(blob);
-    if (!p) return 0;
-
-    raw_size = (DWORD)p[0] | ((DWORD)p[1] << 8) |
-               ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
-    if (!raw_size || raw_size > 16u * 1024u * 1024u) return 0;
-
-    raw = (unsigned char *)h_alloc(h, raw_size + 1);
-    if (!raw) return 0;
-
-    if (!create(COMPRESS_ALGORITHM_LZMS, NULL, &dec) ||
-        !decomp(dec, p + 4, res_size - 4, raw, raw_size, &used) ||
-        used != raw_size) {
-        if (dec && closed) closed(dec);
-        h_free(h, raw);
+    if (!p || res_size <= NOTE_PACK_HEADER) {
+        if (owned) h_free(h, owned);
         return 0;
     }
-    if (closed) closed(dec);
-    raw[raw_size] = 0;
 
-    /* The pack is UTF-8; the core wants the platform's own character type. */
-    cap  = (int)raw_size + 8;
-    text = (nchar *)h_alloc(h, (unsigned long)cap * sizeof(nchar));
-    if (!text) { h_free(h, raw); return 0; }
+    /* The reader is mostly its 4 KB window, which is more than this frame
+     * should carry, and it is finished with before the call returns. */
+    z = (note_pack *)h_alloc(h, sizeof(note_pack));
+    if (!z) { if (owned) h_free(h, owned); return 0; }
 
-    note_decode(ENC_UTF8, raw, raw_size, text, cap);
-    h_free(h, raw);
+    if (!note_pack_open(z, p, res_size)) {
+        h_free(h, z); if (owned) h_free(h, owned); return 0;
+    }
+
+    raw_size = note_pack_size(z);
+    if (!raw_size || raw_size > 16uL * 1024uL * 1024uL) {
+        h_free(h, z); if (owned) h_free(h, owned); return 0;
+    }
+
+    text = (nchar *)h_alloc(h, (raw_size + 1) * sizeof(nchar));
+    if (!text) { h_free(h, z); if (owned) h_free(h, owned); return 0; }
+
+    /* A byte is an nchar: the embedded pack is ASCII by construction, which
+     * tools\compress_packs.ps1 refuses to let stop being true. */
+    for (i = 0; i < raw_size; i++) {
+        int c = note_pack_get(z);
+        if (c < 0) {
+            h_free(h, text); h_free(h, z);
+            if (owned) h_free(h, owned);
+            return 0;
+        }
+        text[i] = (nchar)(unsigned char)c;
+    }
+    text[raw_size] = 0;
+    h_free(h, z);
+    if (owned) h_free(h, owned);
 
     *out = text;
     return 1;
@@ -237,7 +291,7 @@ static int h_embedded_pack(note_host *h, int which, nchar **out)
 void h_file_delete(note_host *h, const nchar *path)
 {
     (void)h;
-    if (path && path[0]) DeleteFileW((LPCWSTR)path);
+    if (path && path[0]) os_delete_file(path);
 }
 
 static int h_file_exists(note_host *h, const nchar *path)
@@ -245,29 +299,34 @@ static int h_file_exists(note_host *h, const nchar *path)
     DWORD attr;
     (void)h;
     if (!path || !path[0]) return 0;
-    attr = GetFileAttributesW((LPCWSTR)path);
+    attr = os_file_attrs(path);
     return attr != INVALID_FILE_ATTRIBUTES;
 }
 
-/* MOVEFILE_COPY_ALLOWED so that moving to another volume works: a plain
- * rename there fails, and the user asked for the file to end up in the new
- * place, not for a lecture about partitions.  MOVEFILE_REPLACE_EXISTING is
- * deliberately absent — the core has already refused a target that exists,
- * and this is the second lock on the same door. */
+/* os_move_file moves across volumes where it can: a plain rename fails there,
+ * and the user asked for the file to end up in the new place, not for a
+ * lecture about partitions.  Replacing an existing target is deliberately not
+ * asked for — the core has already refused a name that exists, and this is the
+ * second lock on the same door. */
 static int h_file_rename(note_host *h, const nchar *from, const nchar *to)
 {
     (void)h;
     if (!from || !from[0] || !to || !to[0]) return 0;
-    return MoveFileExW((LPCWSTR)from, (LPCWSTR)to, MOVEFILE_COPY_ALLOWED) ? 1 : 0;
+    return os_move_file(from, to);
 }
 
 /* The palette is the only surface note asks a free-text question on, so it is
  * where an answer of "no, because..." belongs. */
-static void h_set_hint(note_host *h, const nchar *text)
+void h_set_hint_text(note_host *h, const nchar *text)
 {
     n_copy((nchar *)h->pal_msg, text ? text : N(""),
            (int)(sizeof(h->pal_msg) / sizeof(h->pal_msg[0])));
     if (h->pal && h->pal_open) InvalidateRect(h->pal, NULL, FALSE);
+}
+
+static void h_set_hint(note_host *h, const nchar *text)
+{
+    h_set_hint_text(h, text);
 }
 
 static void h_quit(note_host *h)
@@ -288,6 +347,8 @@ static void h_pick(note_host *h, int what)
     /* Rename's mode number is private to win32_palette.c for now; see the
      * comment there.  This is the door it opens instead. */
     case PICK_RENAME: pal_open_rename(h); break;
+    case PICK_PATH:   pal_open_path(h);   break;
+    case PICK_RUN:    pal_open_run(h);    break;
     default: break;
     }
 }
@@ -305,6 +366,6 @@ const note_host_ops kOps = {
     h_find_text, h_goto_line, h_time_date, h_system_dark,
     h_state_dir, h_exe_dir, h_dir_make, h_dir_list,
     h_file_read, h_file_write, h_file_delete, h_embedded_pack,
-    h_file_exists, h_file_rename, h_set_hint, h_quit
+    h_file_exists, h_file_rename, h_set_hint, help_show, h_quit
 };
 
