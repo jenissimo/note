@@ -174,10 +174,17 @@ def main():
     # shell upscales the largest entry it has for Explorer's large-icon views
     # and for Alt+Tab on a high-DPI display.
     #
-    # 128 is left out: 256 downscales to it cleanly and nothing asks for both.
+    # 128 is left out: 64 upscales to it acceptably and nothing asks for both.
+    #
+    # 256 is left out too, and that one is a real trade.  Its PNG is 2.2 KB of
+    # already-compressed data -- the single largest entry here, and one UPX
+    # cannot squeeze any further -- and carrying it is what put the packed
+    # build over 64 KB.  Explorer's extra-large view now upscales the 64, which
+    # is softer than a drawn 256 but still reads: the icon is a page with a
+    # coloured band, not something with fine detail to lose.
     sizes = [(16, "bmp"),
              (20, "png"), (24, "png"), (32, "png"), (48, "png"),
-             (64, "png"), (256, "png")]
+             (64, "png")]
 
     images = []
     for size, kind in sizes:
