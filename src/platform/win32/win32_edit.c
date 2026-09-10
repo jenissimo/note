@@ -3,6 +3,12 @@
  * Part of note's Win32 backend.  The shared state and the types every part of
  * it needs live in note_win32.h; see there for why the state is a header and
  * not a private static.
+ *
+ * Everything here that talks to the control is compiled only when the build
+ * is on the RICHEDIT path.  With NOTE_OWN_VIEW the same jobs -- the text, the
+ * selection, the gutter, the colouring -- are done by win32_view.c over the
+ * core's own buffer, and none of this is reachable.  The heap and the status
+ * bar are outside the switch because neither ever knew what the text was.
  */
 
 #include "note_win32.h"
@@ -20,6 +26,8 @@ void h_free(note_host *h, void *p)
 {
     if (p) HeapFree(h->heap, 0, p);
 }
+
+#if !NOTE_OWN_VIEW
 
 int edit_len(HWND e)
 {
@@ -62,6 +70,7 @@ void h_text_set(note_host *h, int doc, const nchar *s)
     SendMessageW(h->d[doc].edit, EM_SETTEXTEX, (WPARAM)&st, (LPARAM)s);
     h->suppress--;
     SendMessageW(h->d[doc].edit, EM_EMPTYUNDOBUFFER, 0, 0);
+    hl_invalidate(h, doc);
     if (doc == h->app.active) h->cache_valid = 0;
 }
 
@@ -113,6 +122,24 @@ void h_set_modified(note_host *h, int doc, int modified)
     SendMessageW(h->d[doc].edit, EM_SETMODIFY, (WPARAM)(modified ? TRUE : FALSE), 0);
 }
 
+void edit_show_caret(note_host *h)
+{
+    (void)h;
+    SendMessageW(active_edit(), EM_SCROLLCARET, 0, 0);
+}
+
+int edit_text_range(note_host *h, int from, int to, nchar *dst, int cap)
+{
+    TEXTRANGEW tr;
+    (void)h;
+    if (cap > 0) dst[0] = 0;
+    if (to - from + 1 > cap) to = from + cap - 1;
+    tr.chrg.cpMin = from;
+    tr.chrg.cpMax = to;
+    tr.lpstrText  = (LPWSTR)dst;
+    return (int)SendMessageW(active_edit(), EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+}
+
 /* -------------------------------------------------------------------------
  * Layout, gutter and highlighting
  * ------------------------------------------------------------------------- */
@@ -121,7 +148,7 @@ void relayout(note_host *h);
 void queue_view(note_host *h);
 void refresh_cache(note_host *h);
 void menu_set_brush(HMENU m, HBRUSH br);
-COLORREF blend_rgb(unsigned a, unsigned b);
+COLORREF blend_rgb(note_color a, note_color b);
 /* The command palette, further down: the ops table needs to open it in one of
  * its list modes long before the overlay itself is defined. */
 void pal_open_mode(note_host *h, int mode);
@@ -183,8 +210,9 @@ static void gutter_paint(HWND wnd)
     PAINTSTRUCT ps;
     HDC   dc;
     RECT  rc;
+    CHARRANGE sel;
     HWND  e = active_edit();
-    int   first, y, y0, rowh, para, i;
+    int   first, y, y0, rowh, para, i, caret_para;
     HFONT old;
 
     dc = BeginPaint(wnd, &ps);
@@ -195,8 +223,13 @@ static void gutter_paint(HWND wnd)
 
     refresh_cache(&g);
 
+    /* The paragraph the caret is in, so its number can be lit and the rest
+     * left quiet.  Paragraph and not display row: a wrapped line is one line
+     * as far as anyone reading the numbers is concerned. */
+    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
+    caret_para = para_at(&g, (int)sel.cpMin);
+
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, cr(g.theme.gutter_fg));
     old = (HFONT)SelectObject(dc, g.uifont);
 
     first = (int)SendMessageW(e, EM_GETFIRSTVISIBLELINE, 0, 0);
@@ -229,17 +262,34 @@ static void gutter_paint(HWND wnd)
     }
 
     for (i = first, y = y0; y < rc.bottom; i++, y += rowh) {
-        int start = line_start(e, i);
+        int  start = line_start(e, i);
+        int  head, row_para;
+        RECT tr;
+
         if (start < 0) break;
 
-        /* A wrapped continuation row gets no number of its own. */
-        if (para_starts_at(g.cache, g.cache_len, start)) {
+        /* A wrapped continuation row gets no number of its own -- but it is
+         * still part of the paragraph above it, and the wash has to cover it
+         * too or a wrapped current line would be striped. */
+        head     = para_starts_at(g.cache, g.cache_len, start);
+        row_para = head ? para : para - 1;
+
+        tr.left = 0;  tr.right  = rc.right;
+        tr.top  = y;  tr.bottom = y + rowh;
+
+        /* The same wash the line itself carries, so the number and its line
+         * read as one band across the window. */
+        if (row_para == caret_para) FillRect(dc, &tr, g.br_curline);
+
+        if (head) {
             nchar num[12];
-            int n = n_utoa((unsigned)para, num);
-            RECT tr;
-            tr.left = 0;  tr.right  = rc.right - 6;
-            tr.top  = y;  tr.bottom = y + rowh;
-            DrawTextW(dc, (LPCWSTR)num, n, &tr, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+            int   n = n_utoa((unsigned)para, num);
+            tr.right -= 6;
+            SetTextColor(dc, cr(row_para == caret_para ? g.theme.fg
+                                                       : g.theme.gutter_fg));
+            /* os_draw_text: DrawTextW is a stub on Windows 95 -- see
+             * StatusProc below -- and the numbers simply would not appear. */
+            os_draw_text(dc, num, n, &tr, DT_RIGHT | DT_TOP | DT_SINGLELINE);
             para++;
         }
     }
@@ -255,6 +305,8 @@ LRESULT CALLBACK GutterProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(wnd, msg, wp, lp);
 }
 
+#endif /* !NOTE_OWN_VIEW */
+
 LRESULT CALLBACK StatusProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_ERASEBKGND) return 1;   /* WM_PAINT covers every pixel */
@@ -268,51 +320,89 @@ LRESULT CALLBACK StatusProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         GetClientRect(wnd, &rc);
         FillRect(dc, &rc, g.br_ui);
 
+        /* One rule along the top.  The band is filled with br_ui and so is the
+         * frame behind it, so without a line there is nothing to see: a status
+         * bar whose text has not been written yet, or could not be, is exactly
+         * the window background and reads as no status bar at all.
+         *
+         * Through chrome_apart() rather than br_sep, which is a fifth of the
+         * way from the band towards its text and on a dark theme at 8bpp lands
+         * back on the band's own black.  A rule that is the colour of what it
+         * separates is not a quiet rule, it is no rule. */
+        fill_px(dc, rc.left, rc.top, rc.right - rc.left, 1,
+                chrome_apart(g.theme.ui_bg, g.theme.ui_fg, 1, 5,
+                             chrome_snap(cr(g.theme.ui_bg))));
+        rc.top += 1;
+
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, cr(g.theme.ui_fg));
         old = (HFONT)SelectObject(dc, g.menufont);
         rc.left += px(8);
-        DrawTextW(dc, g.status_text, -1, &rc,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        /* os_draw_text, not DrawTextW: DrawText is user32, where Windows 95
+         * answers the W entry point with a stub that draws nothing and returns
+         * zero.  Nothing fails and nothing is reported -- the band is painted,
+         * the text simply never appears, and against a background of the same
+         * colour that looks like a status bar that was never created. */
+        os_draw_text(dc, (const nchar *)g.status_text, -1, &rc,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, old);
 
         EndPaint(wnd, &ps);
         return 0;
     }
-    return DefWindowProcW(wnd, msg, wp, lp);
+    /* os_defproc for the same reason: on Windows 95 this class is registered
+     * through RegisterClassExA, and the default handling has to be the half
+     * that matches. */
+    return os_defproc(wnd, msg, wp, lp);
 }
+
+#if !NOTE_OWN_VIEW
 
 /* One pass over the cache recording where each paragraph starts, so that
  * "which line is this offset on" stops being a scan from the top of the
- * document.  Two passes rather than a growing array: counting first costs a
- * second walk of memory the CPU has just streamed, and buys one allocation of
- * exactly the right size. */
+ * document.
+ *
+ * One pass into an array that grows, and is then kept.  It used to be two
+ * passes -- count, allocate exactly, fill -- which reads a thirteen-megabyte
+ * document twice and hands the heap a megabyte-sized block to free and
+ * reallocate on every keystroke.  Doubling wastes at most half the array once
+ * and costs nothing after the file settles. */
+static int lines_room(note_host *h, int want)
+{
+    int  cap = h->lines_cap;
+    int *grown;
+
+    if (cap >= want) return 1;
+    if (cap < 256) cap = 256;
+    while (cap < want) cap *= 2;
+
+    grown = (int *)h_alloc(h, (unsigned long)cap * sizeof(int));
+    if (!grown) return 0;
+    if (h->lines) {
+        int i;
+        for (i = 0; i < h->nlines; i++) grown[i] = h->lines[i];
+        h_free(h, h->lines);
+    }
+    h->lines     = grown;
+    h->lines_cap = cap;
+    return 1;
+}
+
 static void build_line_index(note_host *h)
 {
-    int i, n;
+    int i;
 
-    if (h->lines) { h_free(h, h->lines); h->lines = 0; }
     h->nlines = 0;
-    if (!h->cache) return;
-
-    n = 1;
-    for (i = 0; i < h->cache_len; i++) {
-        if (is_break(h->cache[i])) {
-            if (h->cache[i] == (nchar)'\r' && h->cache[i + 1] == (nchar)'\n') i++;
-            n++;
-        }
-    }
-
-    h->lines = (int *)h_alloc(h, (unsigned long)n * sizeof(int));
-    if (!h->lines) return;
+    if (!h->cache || !lines_room(h, 1)) return;
 
     h->lines[0] = 0;
-    h->nlines = 1;
-    for (i = 0; i < h->cache_len && h->nlines < n; i++) {
-        if (is_break(h->cache[i])) {
-            if (h->cache[i] == (nchar)'\r' && h->cache[i + 1] == (nchar)'\n') i++;
-            h->lines[h->nlines++] = i + 1;
-        }
+    h->nlines   = 1;
+
+    for (i = 0; i < h->cache_len; i++) {
+        if (!is_break(h->cache[i])) continue;
+        if (h->cache[i] == (nchar)'\r' && h->cache[i + 1] == (nchar)'\n') i++;
+        if (!lines_room(h, h->nlines + 1)) return;
+        h->lines[h->nlines++] = i + 1;
     }
 }
 
@@ -330,6 +420,43 @@ int para_at(note_host *h, int off)
     return best + 1;
 }
 
+/* The paragraph and the column an offset is on, which is what the status bar
+ * says.  A paragraph and not a display row: a long line wrapped across three
+ * rows is one line as far as anyone reading the number is concerned. */
+void edit_status_pos(note_host *h, int pos, int *line, int *col)
+{
+    HWND e = active_edit();
+    LONG row, start;
+
+    row   = (LONG)SendMessageW(e, EM_EXLINEFROMCHAR, 0, (LPARAM)pos);
+    start = (LONG)SendMessageW(e, EM_LINEINDEX, (WPARAM)row, 0);
+
+    refresh_cache(h);
+    *line = para_at(h, pos);
+    *col  = (int)(pos - start) + 1;
+}
+
+/* The cache buffer is kept between refreshes and only ever grows, with a
+ * quarter of slack on top.  Freeing and reallocating twenty-six megabytes on
+ * every keystroke is not the sort of cost the heap absorbs quietly, and the
+ * length of a document being typed into changes by one. */
+static int cache_room(note_host *h, int want)
+{
+    int    cap = h->cache_cap;
+    nchar *grown;
+
+    if (cap >= want) return 1;
+
+    cap = want + want / 4 + 64;
+    grown = (nchar *)h_alloc(h, (unsigned long)cap * sizeof(nchar));
+    if (!grown) return 0;
+
+    if (h->cache) h_free(h, h->cache);
+    h->cache     = grown;
+    h->cache_cap = cap;
+    return 1;
+}
+
 void refresh_cache(note_host *h)
 {
     int len;
@@ -337,60 +464,144 @@ void refresh_cache(note_host *h)
     if (h->cache_valid && h->cache_doc == h->app.active) return;
 
     len = edit_len(active_edit());
-    if (h->cache) { h_free(h, h->cache); h->cache = 0; }
-    h->cache = (nchar *)h_alloc(h, (unsigned long)(len + 2) * sizeof(nchar));
-    if (!h->cache) { h->cache_len = 0; h->cache_valid = 0; return; }
+    if (!cache_room(h, len + 2)) { h->cache_len = 0; h->cache_valid = 0; return; }
 
-    h_text_get(h, h->app.active, h->cache, len + 1);
-    h->cache_len   = n_len(h->cache);
+    /* EM_GETTEXTEX reports what it copied, so the length is already known: a
+     * strlen over the whole document afterwards is a second walk of it for an
+     * answer we were just handed. */
+    h->cache_len   = h_text_get(h, h->app.active, h->cache, len + 1);
+    if (h->cache_len < 0 || h->cache_len > len) h->cache_len = len;
+    h->cache[h->cache_len] = 0;
     h->cache_doc   = h->app.active;
     h->cache_valid = 1;
     build_line_index(h);
 }
 
-/* Paint the visible range: default colour first, then the lexer's spans. */
-static void highlight(note_host *h)
+/* -------------------------------------------------------------------------
+ * The highlighter
+ *
+ * RichEdit remembers formatting once it has been set, so the useful unit of
+ * work is not "colour the screen" but "extend the range that is already
+ * coloured".  Each document therefore carries hl_from/hl_to -- the stretch of
+ * it known to be coloured -- and a pass only ever fills in what those do not
+ * cover.  Holding Page Down then costs one screenful of colouring per press
+ * instead of recolouring the same viewport on every frame, and it costs the
+ * same on a thirteen-megabyte file as on a small one.
+ *
+ * Two rules keep it responsive:
+ *
+ *   - The viewport is always finished in the pass that asks for it.  Half a
+ *     coloured screen is worse than an uncoloured one.
+ *   - Everything beyond the viewport -- a screenful ahead and a screenful
+ *     behind, so that the next scroll finds its text already done -- is filled
+ *     in HL_CHUNK at a time from a timer, giving the message loop its turn
+ *     back between chunks.
+ *
+ * A worker thread would not help and is not used.  The expensive half is not
+ * the lexing (a screenful is a couple of milliseconds) but the
+ * EM_SETCHARFORMAT calls, and those have to happen on the thread that owns
+ * the control: sending them from anywhere else only blocks this thread to do
+ * the same work in a less predictable order.  Chunking on the UI thread buys
+ * the same responsiveness with none of that.
+ * ------------------------------------------------------------------------- */
+
+/* An edit, rather than a change of theme or language.
+ *
+ * Nothing above the paragraph the edit landed in can lex differently because
+ * of it -- a quote or a comment opener only ever reaches forwards -- so the
+ * coloured range is trimmed back to the start of that paragraph instead of
+ * being thrown away.  Typing then recolours the paragraph under the caret and
+ * whatever of the viewport lies below it, rather than the whole screen on
+ * every keystroke, and each of those screenfuls was a few hundred
+ * EM_SETCHARFORMAT calls.
+ *
+ * The trimming itself waits for hl_settle(): the line index it needs is
+ * rebuilt from the control after the edit, and this runs during it. */
+void hl_touch(note_host *h, int doc, int caret)
 {
-    HWND e = active_edit();
-    CHARFORMAT2W cf;
-    CHARRANGE    sel, all;
-    ITextDocument *tom;
-    POINT scroll;
-    int first, rows, vis_start, vis_end, scan_start, nspans, i, lang, was_mod;
+    win_doc *d;
+    int      off = caret;
 
-    if (!e) return;
+    if (doc < 0 || doc >= NOTE_MAX_DOCS) return;
+    d = &h->d[doc];
+    d->cur_valid = 0;             /* the band's offsets have moved */
 
-    refresh_cache(h);
+    if (!d->hl_valid) return;
 
-    lang = h->app.syntax ? h->app.docs[h->app.active].lang : LANG_NONE;
-
-    first = (int)SendMessageW(e, EM_GETFIRSTVISIBLELINE, 0, 0);
-    {
-        RECT rc;
-        GetClientRect(e, &rc);
-        rows = (h->line_h > 0) ? (rc.bottom / h->line_h) + 2 : 60;
+    /* The caret is where the edit *ended*.  After a deletion that is also
+     * where it began, but after an insertion the new text lies behind the
+     * caret, and pasting a screenful of it would otherwise leave everything
+     * but its last paragraph coloured as it was.  How much the document grew
+     * says how far back to reach; several edits arriving before a refresh
+     * only make that reach further, which errs the safe way. */
+    /* Not cache_valid: the first keystroke of a burst clears it, and the
+     * length recorded at the last refresh is still the right baseline for
+     * every keystroke after that one. */
+    if (h->cache && h->cache_doc == doc) {
+        int grew = edit_len(h->d[doc].edit) - h->cache_len;
+        if (grew > 0) off -= grew;
+    } else {
+        off = 0;                  /* no idea what changed: colour it all */
     }
-    vis_start = line_start(e, first);
-    vis_end   = line_start(e, first + rows);
-    if (vis_start < 0) vis_start = 0;
-    if (vis_end   < 0) vis_end = h->cache_len;
-    if (vis_end > h->cache_len) vis_end = h->cache_len;
+    if (off < 0) off = 0;
 
-    /* Block comments and long strings begin before the viewport, so the lexer
-     * cannot simply start at the top of the view.  It used to start at the top
-     * of the *document* instead, which is correct but re-lexes the whole
-     * prefix on every frame: measured at 61 ms per frame on a 427 KB file and
-     * 74 ms on a 677 KB one, against a 40 ms tick — which is exactly what made
-     * holding Page Down lag.  Asking the core for the nearest point known to
-     * be outside any construct costs a backwards character scan instead, and
-     * brings both files to about 2.5 ms, independent of their size. */
-    scan_start = note_syntax_safe_start(lang, h->cache, h->cache_len,
-                                        vis_start, SAFE_START_WINDOW);
+    if (d->hl_dirty_at < 0 || off < d->hl_dirty_at) d->hl_dirty_at = off;
+}
 
-    nspans = (lang == LANG_NONE) ? 0
-           : note_tokenize(lang, h->cache + scan_start,
-                           (vis_end > scan_start) ? vis_end - scan_start : 0,
-                           scan_start, h->spans, MAX_SPANS);
+/* Resolves a pending hl_touch now that the cache and the line index agree
+ * with the control again.  Called from the two places that colour. */
+static void hl_settle(note_host *h, win_doc *d)
+{
+    int start;
+
+    if (d->hl_dirty_at < 0) return;
+    d->hl_dirty_at = (d->hl_dirty_at > h->cache_len) ? h->cache_len
+                                                     : d->hl_dirty_at;
+    start = 0;
+    if (h->lines && h->nlines > 0)
+        start = h->lines[para_at(h, d->hl_dirty_at) - 1];
+
+    if (!d->hl_valid || start <= d->hl_from) {
+        d->hl_valid = 0;
+        d->hl_from  = d->hl_to = 0;
+    } else if (d->hl_to > start) {
+        d->hl_to = start;
+    }
+    d->hl_dirty_at = -1;
+}
+
+void hl_invalidate(note_host *h, int doc)
+{
+    int i;
+    for (i = 0; i < NOTE_MAX_DOCS; i++)
+        if (doc < 0 || doc == i) {
+            h->d[i].hl_valid = 0;
+            h->d[i].hl_from = h->d[i].hl_to = 0;
+            h->d[i].hl_dirty_at = -1;
+            /* The caret's band is a background rather than a colour, so
+             * nothing above repaints it -- but it was mixed from the theme
+             * and sits on offsets the text may have moved, so it goes too. */
+            h->d[i].cur_valid = 0;
+        }
+}
+
+/* Colours [from,to) from the lexer: the default colour over the whole range
+ * first, then the spans on top of it.  Tokenising is done in slices, because
+ * the span array is fixed and a large range would overflow it -- and each
+ * slice still starts from the nearest point the core can promise is outside
+ * any string or block comment, which is what keeps the cost independent of
+ * how far down the file the range happens to be. */
+static void colour_range(note_host *h, HWND e, int lang, int from, int to)
+{
+    CHARFORMAT2W   cf;
+    CHARRANGE      sel, r;
+    ITextDocument *tom;
+    POINT          scroll;
+    int            was_mod, at;
+
+    if (from < 0) from = 0;
+    if (to > h->cache_len) to = h->cache_len;
+    if (to <= from) return;
 
     SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
     SendMessageW(e, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
@@ -400,6 +611,8 @@ static void highlight(note_host *h)
      * put it back, so opening a file never leaves it looking edited. */
     was_mod = (int)SendMessageW(e, EM_GETMODIFY, 0, 0);
 
+    /* Formatting would otherwise pile records onto the undo stack, and Ctrl+Z
+     * would undo the highlighter instead of the typing. */
     tom = tom_open(e);
     if (tom) tom->lpVtbl->Undo(tom, tomSuspend, 0);
 
@@ -407,25 +620,46 @@ static void highlight(note_host *h)
     SendMessageW(e, WM_SETREDRAW, FALSE, 0);
 
     memset(&cf, 0, sizeof(cf));
-    cf.cbSize  = sizeof(cf);
-    cf.dwMask  = CFM_COLOR;
+    cf.cbSize      = sizeof(cf);
+    cf.dwMask      = CFM_COLOR;
     cf.crTextColor = cr(h->theme.fg);
 
-    all.cpMin = vis_start; all.cpMax = vis_end;
-    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&all);
+    r.cpMin = from; r.cpMax = to;
+    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
     SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 
-    for (i = 0; i < nspans; i++) {
-        CHARRANGE r;
-        if (h->spans[i].start + h->spans[i].len <= vis_start) continue;
-        if (h->spans[i].start >= vis_end) break;
-        r.cpMin = h->spans[i].start;
-        r.cpMax = h->spans[i].start + h->spans[i].len;
-        if (r.cpMin < vis_start) r.cpMin = vis_start;
-        if (r.cpMax > vis_end)   r.cpMax = vis_end;
-        cf.crTextColor = cr(h->theme.tok[h->spans[i].kind]);
-        SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
-        SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    for (at = from; lang != LANG_NONE && at < to; ) {
+        int end = at + HL_SLICE;
+        int scan, nspans, i;
+
+        if (end > to) end = to;
+
+        scan   = note_syntax_safe_start(lang, h->cache, h->cache_len,
+                                        at, SAFE_START_WINDOW);
+        nspans = note_tokenize(lang, h->cache + scan, end - scan, scan,
+                               h->spans, MAX_SPANS);
+
+        for (i = 0; i < nspans; i++) {
+            if (h->spans[i].start + h->spans[i].len <= at) continue;
+            if (h->spans[i].start >= end) break;
+            r.cpMin = h->spans[i].start;
+            r.cpMax = h->spans[i].start + h->spans[i].len;
+            if (r.cpMin < at)  r.cpMin = at;
+            if (r.cpMax > end) r.cpMax = end;
+            cf.crTextColor = cr(h->theme.tok[h->spans[i].kind]);
+            SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
+            SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+        }
+        cf.crTextColor = cr(h->theme.fg);
+
+        /* A slice dense enough to fill the span array would leave its tail
+         * uncoloured, and the caller is about to record it as done.  Stop at
+         * the last span that did fit and let the next slice carry on there. */
+        if (nspans >= MAX_SPANS) {
+            int fit = h->spans[MAX_SPANS - 1].start;
+            if (fit > at) end = fit;
+        }
+        at = end;
     }
 
     SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
@@ -438,8 +672,328 @@ static void highlight(note_host *h)
         tom->lpVtbl->Undo(tom, tomResume, 0);
         tom->lpVtbl->Release(tom);
     }
+}
+
+/* -------------------------------------------------------------------------
+ * The caret's line
+ *
+ * RichEdit has no notion of a highlighted line and no way to paint underneath
+ * one: the control owns every pixel of its client area and its background is
+ * one colour for the whole document.  What it does have is a background
+ * colour per character, so the band under the text is exactly that -- a
+ * background given to the characters the caret's paragraph is made of.
+ *
+ * That alone would stop the band where the text stops, which is not a band at
+ * all but a highlighted word.  The rest of each row is empty -- the margin the
+ * control keeps to the left of the first character, and everything from the
+ * last character out to the scroll bar -- so both ends can be filled in after
+ * the control has painted, without drawing over anything.  The three pieces
+ * use one colour and read as one stripe.
+ *
+ * The paragraph break is included in the character range on purpose: it is
+ * what gives an empty line something to show.
+ * ------------------------------------------------------------------------- */
+
+/* Mixed rather than named: no theme has an opinion about a caret line, but
+ * every theme has a foreground and a background.  Defined with the rest of the
+ * band's drawing, further down. */
+static COLORREF curline_rgb(note_host *h);
+
+/* Both halves of the work are the same call twice, so it is written once. */
+static void band_apply(note_host *h, HWND e, int from, int to, int on)
+{
+    CHARFORMAT2W   cf;
+    CHARRANGE      sel, r;
+    ITextDocument *tom;
+    POINT          scroll;
+    int            was_mod;
+
+    if (to <= from) return;
+
+    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
+    SendMessageW(e, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    was_mod = (int)SendMessageW(e, EM_GETMODIFY, 0, 0);
+
+    tom = tom_open(e);
+    if (tom) tom->lpVtbl->Undo(tom, tomSuspend, 0);
+
+    h->suppress++;
+    SendMessageW(e, WM_SETREDRAW, FALSE, 0);
+
+    memset(&cf, 0, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_BACKCOLOR;
+    if (on) cf.crBackColor = curline_rgb(h);
+    else    cf.dwEffects   = CFE_AUTOBACKCOLOR;   /* back to the page */
+
+    r.cpMin = from; r.cpMax = to;
+    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
+    SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
+    SendMessageW(e, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+    SendMessageW(e, EM_SETMODIFY, (WPARAM)(was_mod ? TRUE : FALSE), 0);
+    SendMessageW(e, WM_SETREDRAW, TRUE, 0);
+    h->suppress--;
+
+    if (tom) {
+        tom->lpVtbl->Undo(tom, tomResume, 0);
+        tom->lpVtbl->Release(tom);
+    }
+}
+
+void curline_update(note_host *h)
+{
+    HWND      e = active_edit();
+    win_doc  *d;
+    CHARRANGE sel;
+    int       para, from, to, want;
+
+    if (!e) return;
+    d = &h->d[h->app.active];
+
+    refresh_cache(h);
+    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
+
+    /* Nothing while a selection is up: two overlapping washes say less than
+     * either of them alone. */
+    want = (sel.cpMin == sel.cpMax);
+
+    from = to = 0;
+    if (want && h->lines && h->nlines > 0) {
+        para = para_at(h, (int)sel.cpMin);
+        from = h->lines[para - 1];
+        to   = (para < h->nlines) ? h->lines[para] : h->cache_len;
+        if (to > h->cache_len) to = h->cache_len;
+        if (to < from) to = from;
+    } else {
+        want = 0;
+    }
+
+    if (d->cur_valid && d->cur_from == from && d->cur_to == to && want) return;
+
+    /* Taking the old band off first: after an edit the offsets it was on may
+     * no longer be the line they were, but putting a background back to the
+     * page can only ever remove a band, never leave one in the wrong place. */
+    if (d->cur_valid) band_apply(h, e, d->cur_from, d->cur_to, 0);
+    d->cur_valid = 0;
+
+    if (want) {
+        band_apply(h, e, from, to, 1);
+        d->cur_from  = from;
+        d->cur_to    = to;
+        d->cur_valid = 1;
+    }
 
     InvalidateRect(e, NULL, FALSE);
+}
+
+static COLORREF curline_rgb(note_host *h)
+{
+    return mix_rgb(h->theme.fg, h->theme.bg, 1, 12);
+}
+
+/* Fills the empty ends of every row the caret's paragraph occupies, after the
+ * control has drawn the row itself.  Called from EditProc's WM_PAINT, which is
+ * the only moment at which those pixels are known to be background and nothing
+ * else. */
+void curline_tail(note_host *h, HWND e)
+{
+    win_doc *d = &h->d[h->app.active];
+    HDC      dc;
+    HBRUSH   br;
+    RECT     rc;
+    POINTL   p;
+    int      first, last, top, rowh, charw, i;
+
+    if (!d->cur_valid || e != d->edit) return;
+
+    GetClientRect(e, &rc);
+
+    first = (int)SendMessageW(e, EM_EXLINEFROMCHAR, 0, (LPARAM)d->cur_from);
+    last  = (int)SendMessageW(e, EM_EXLINEFROMCHAR, 0,
+                              (LPARAM)(d->cur_to > d->cur_from ? d->cur_to - 1
+                                                               : d->cur_from));
+
+    p.x = p.y = 0;
+    SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)d->cur_from);
+    top = p.y;
+
+    /* Row height and character width the way the control is drawing them now,
+     * which is the measured font scaled by whatever the zoom is. */
+    rowh  = MulDiv(h->line_h, h->app.zoom, 100);
+    charw = MulDiv(h->char_w, h->app.zoom, 100);
+    if (rowh  <= 0) rowh  = 16;
+    if (charw <= 0) charw = 8;
+
+    /* Off the top or the bottom: nothing of it is on screen. */
+    if (top + (last - first + 1) * rowh < 0 || top > rc.bottom) return;
+
+    br = CreateSolidBrush(curline_rgb(h));
+    dc = GetDC(e);
+
+    for (i = first; i <= last; i++) {
+        int   start = (int)SendMessageW(e, EM_LINEINDEX, (WPARAM)i, 0);
+        int   len   = (int)SendMessageW(e, EM_LINELENGTH, (WPARAM)start, 0);
+        int   y     = top + (i - first) * rowh;
+        RECT  fill;
+
+        if (start < 0) break;
+        if (y + rowh < 0 || y > rc.bottom) continue;
+
+        fill.top    = y;
+        fill.bottom = y + rowh;
+        if (fill.top    < 0)         fill.top    = 0;
+        if (fill.bottom > rc.bottom) fill.bottom = rc.bottom;
+
+        /* The margin before the first character.  Without it the band starts a
+         * few pixels in from the gutter and the two do not meet. */
+        p.x = p.y = 0;
+        SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)start);
+        fill.left  = 0;
+        fill.right = p.x;
+        if (fill.right > fill.left && fill.bottom > fill.top)
+            FillRect(dc, &fill, br);
+
+        p.x = p.y = 0;
+        SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)(start + len));
+
+        /* On a wrapped row there is no break to ask about: the character just
+         * past the row is the first of the next one, and the control answers
+         * with that row's origin.  One character further back and one
+         * character's width forward lands in the same place -- the font is
+         * always a monospaced one here, which is what makes that exact. */
+        if (p.y != y && len > 0) {
+            p.x = p.y = 0;
+            SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)(start + len - 1));
+            p.x += charw;
+        }
+
+        fill.left  = p.x;
+        fill.right = rc.right;
+        if (fill.right > fill.left && fill.bottom > fill.top)
+            FillRect(dc, &fill, br);
+    }
+
+    ReleaseDC(e, dc);
+    DeleteObject(br);
+}
+
+/* Makes sure [a,b) is coloured, spending at most `budget` characters on it.
+ * The coloured stretch is one range, so a request either extends it at one or
+ * both ends or -- after a jump -- replaces it.  Returns 1 when the whole of
+ * [a,b) is covered, and 0 when the budget ran out first and there is more to
+ * do on the next pass. */
+static int hl_cover(note_host *h, HWND e, win_doc *d, int lang,
+                    int a, int b, int budget)
+{
+    if (a < 0) a = 0;
+    if (b > h->cache_len) b = h->cache_len;
+    if (b < a) b = a;
+
+    /* Nothing coloured, or nothing of it near enough to build on. */
+    if (!d->hl_valid || b < d->hl_from || a > d->hl_to) {
+        int to = (b - a > budget) ? a + budget : b;
+        colour_range(h, e, lang, a, to);
+        d->hl_from  = a;
+        d->hl_to    = to;
+        d->hl_valid = 1;
+        return to >= b;
+    }
+
+    /* Forwards first: that is the direction reading and scrolling go. */
+    if (b > d->hl_to) {
+        int to = (b - d->hl_to > budget) ? d->hl_to + budget : b;
+        budget -= to - d->hl_to;
+        colour_range(h, e, lang, d->hl_to, to);
+        d->hl_to = to;
+    }
+    if (a < d->hl_from && budget > 0) {
+        int from = (d->hl_from - a > budget) ? d->hl_from - budget : a;
+        colour_range(h, e, lang, from, d->hl_from);
+        d->hl_from = from;
+    }
+    return d->hl_from <= a && d->hl_to >= b;
+}
+
+/* The viewport in characters, and the same again a screenful either side. */
+static void hl_window(note_host *h, HWND e,
+                      int *vis_from, int *vis_to, int *want_from, int *want_to)
+{
+    int first, rows, over;
+
+    first = (int)SendMessageW(e, EM_GETFIRSTVISIBLELINE, 0, 0);
+    {
+        RECT rc;
+        GetClientRect(e, &rc);
+        rows = (h->line_h > 0) ? (rc.bottom / h->line_h) + 2 : 60;
+    }
+
+    *vis_from = line_start(e, first);
+    *vis_to   = line_start(e, first + rows);
+    if (*vis_from < 0) *vis_from = 0;
+    if (*vis_to   < 0) *vis_to = h->cache_len;
+
+    over       = (first > rows) ? first - rows : 0;
+    *want_from = line_start(e, over);
+    if (*want_from < 0) *want_from = 0;
+    *want_to = line_start(e, first + rows * 2);
+    if (*want_to < 0) *want_to = h->cache_len;
+}
+
+static int hl_lang(note_host *h)
+{
+    return h->app.syntax ? h->app.docs[h->app.active].lang : LANG_NONE;
+}
+
+/* One idle chunk of the work either side of the viewport.  Stops the timer as
+ * soon as there is nothing left to do, so an editor sitting still costs
+ * nothing. */
+void hl_step(note_host *h)
+{
+    HWND     e = active_edit();
+    win_doc *d = &h->d[h->app.active];
+    int      vis_from, vis_to, want_from, want_to;
+
+    if (!e || !d->hl_valid) { KillTimer(h->wnd, TIMER_HL); return; }
+
+    refresh_cache(h);
+    hl_settle(h, d);
+    hl_window(h, e, &vis_from, &vis_to, &want_from, &want_to);
+
+    if (hl_cover(h, e, d, hl_lang(h), want_from, want_to, HL_CHUNK))
+        KillTimer(h->wnd, TIMER_HL);
+}
+
+/* Colours what is on screen, now, and arms the timer for the rest. */
+static void highlight(note_host *h)
+{
+    HWND     e = active_edit();
+    win_doc *d;
+    int      vis_from, vis_to, want_from, want_to, had_from, had_to, valid;
+
+    if (!e) return;
+
+    refresh_cache(h);
+    d = &h->d[h->app.active];
+    hl_settle(h, d);
+
+    hl_window(h, e, &vis_from, &vis_to, &want_from, &want_to);
+
+    had_from = d->hl_from;
+    had_to   = d->hl_to;
+    valid    = d->hl_valid;
+
+    /* No budget: whatever the screen shows is coloured before this returns. */
+    hl_cover(h, e, d, hl_lang(h), vis_from, vis_to, h->cache_len + 1);
+
+    /* Only when something actually changed on screen -- a scroll that lands
+     * inside the coloured range repaints nothing. */
+    if (!valid || d->hl_from != had_from || d->hl_to != had_to)
+        InvalidateRect(e, NULL, FALSE);
+
+    if (d->hl_from > want_from || d->hl_to < want_to)
+        SetTimer(h->wnd, TIMER_HL, 25, NULL);
 }
 
 void queue_view(note_host *h)
@@ -457,13 +1011,108 @@ void service_view(note_host *h)
     gutter_width(h);
     relayout(h);
     highlight(h);
+    curline_update(h);
     if (h->gutter) InvalidateRect(h->gutter, NULL, FALSE);
 }
 
 void h_rehighlight(note_host *h)
 {
     h->cache_valid = 0;
+    /* The theme or the language changed under every document, so nothing that
+     * is on screen anywhere is the right colour any more. */
+    hl_invalidate(h, -1);
     queue_view(h);
+}
+
+/* -------------------------------------------------------------------------
+ * Indenting
+ *
+ * Tab over a selection that spans lines moves all of them, and Shift+Tab
+ * moves them back -- the one editing gesture RichEdit has no idea about.  A
+ * single caret keeps the plain tab it always had.
+ *
+ * The whole run of lines is replaced in one EM_REPLACESEL, which is what puts
+ * it on the undo stack as one action rather than as one per line.
+ * ------------------------------------------------------------------------- */
+
+#define INDENT_SPACES 4      /* how many a Shift+Tab will take off instead */
+
+/* Shifts the lines the selection touches.  Returns 0 when there was nothing
+ * to shift, and the caller lets the key through as an ordinary tab. */
+static int indent_lines(note_host *h, HWND e, int out)
+{
+    CHARRANGE sel;
+    nchar    *buf;
+    int       first, last, from, to, i, n = 0, cap;
+
+    refresh_cache(h);
+
+    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
+
+    first = para_at(h, (int)sel.cpMin);
+    last  = para_at(h, (int)(sel.cpMax > sel.cpMin ? sel.cpMax - 1 : sel.cpMin));
+
+    if (!h->cache || !h->lines || h->nlines <= 0) return 0;
+
+    /* Indenting a caret sitting in a line is what the Tab key already does.
+     * Outdenting it is not, so that one goes ahead on its own. */
+    if (!out && first == last) return 0;
+
+    from = h->lines[first - 1];
+    to   = (last < h->nlines) ? h->lines[last] : h->cache_len;
+    if (to > h->cache_len) to = h->cache_len;
+    if (to <= from && !(to == from && first == last)) return 0;
+
+    /* One extra character per line is the worst indenting can do. */
+    cap = (to - from) + (last - first + 1) + 2;
+    buf = (nchar *)h_alloc(h, (unsigned long)cap * sizeof(nchar));
+    if (!buf) return 0;
+
+    for (i = first; i <= last; i++) {
+        int ls = h->lines[i - 1];
+        int le = (i < h->nlines) ? h->lines[i] : h->cache_len;
+        int at = ls;
+
+        if (le > h->cache_len) le = h->cache_len;
+
+        if (out) {
+            /* One tab, or up to a tab's worth of spaces -- whichever the line
+             * actually starts with. */
+            int k = 0;
+            if (at < le && h->cache[at] == (nchar)'\t') at++;
+            else while (at < le && k < INDENT_SPACES &&
+                        h->cache[at] == (nchar)' ') { at++; k++; }
+        } else if (le > ls) {
+            /* An empty line gains nothing: trailing whitespace on a line with
+             * nothing on it is not an indent, it is litter. */
+            buf[n++] = (nchar)'\t';
+        }
+
+        while (at < le && n < cap - 1) buf[n++] = h->cache[at++];
+    }
+    buf[n] = 0;
+
+    /* Nothing to do -- every line was already at the left margin. */
+    if (n == to - from) {
+        int same = 1, k;
+        for (k = 0; k < n; k++)
+            if (buf[k] != h->cache[from + k]) { same = 0; break; }
+        if (same) { h_free(h, buf); return out ? 1 : 0; }
+    }
+
+    sel.cpMin = from; sel.cpMax = to;
+    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
+    SendMessageW(e, EM_REPLACESEL, TRUE, (LPARAM)buf);
+
+    /* The same lines, still selected, so a second Tab keeps working on them. */
+    sel.cpMin = from; sel.cpMax = from + n;
+    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
+
+    h_free(h, buf);
+    h->cache_valid = 0;
+    hl_invalidate(h, h->app.active);
+    service_view(h);
+    return 1;
 }
 
 /* -------------------------------------------------------------------------
@@ -481,6 +1130,14 @@ LRESULT CALLBACK EditProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     if (!old) return DefWindowProcW(wnd, msg, wp, lp);
 
     switch (msg) {
+    /* After the control, never instead of it: the tail is drawn over pixels
+     * the control has just painted as background and nothing else. */
+    case WM_PAINT: {
+        LRESULT r = CallWindowProcW(old, wnd, msg, wp, lp);
+        curline_tail(&g, wnd);
+        return r;
+    }
+
     case WM_CONTEXTMENU: {
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
         if (x == -1 && y == -1) {
@@ -490,10 +1147,27 @@ LRESULT CALLBACK EditProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         TrackPopupMenu(g.ctxmenu, TPM_RIGHTBUTTON, x, y, 0, g.wnd, NULL);
         return 0;
     }
+    /* The tab the key would have typed.  The message loop translates a key
+     * into its character before anything dispatches the key itself, so the
+     * WM_CHAR is already on its way by the time the shift below has run --
+     * and it would land on the block that was just indented and replace the
+     * whole of it with one tab.  Indenting therefore has to eat the character
+     * as well as the key. */
+    case WM_CHAR:
+        if (wp == (WPARAM)'\t' && g.eat_tab) { g.eat_tab = 0; return 0; }
+        g.eat_tab = 0;
+        break;
+
+    case WM_KEYDOWN:
+        if (wp == VK_TAB && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            int out = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (indent_lines(&g, wnd, out)) { g.eat_tab = 1; return 0; }
+        }
+        /* fall through to the refresh every key gets */
+
     case WM_VSCROLL:
     case WM_HSCROLL:
     case WM_MOUSEWHEEL:
-    case WM_KEYDOWN:
     case WM_LBUTTONDOWN:
     case WM_SIZE: {
         LRESULT r = CallWindowProcW(old, wnd, msg, wp, lp);
@@ -507,4 +1181,6 @@ LRESULT CALLBACK EditProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     return CallWindowProcW(old, wnd, msg, wp, lp);
 }
+
+#endif /* !NOTE_OWN_VIEW */
 
