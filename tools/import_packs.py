@@ -553,6 +553,22 @@ Regenerate both with:
 # complete editor.  Everything else stays in the full packs beside it, which
 # override these by name when present.  Chosen by what a Notepad replacement
 # is actually pointed at, not by what exists.
+#
+# The list is also a size decision, and it was made with numbers.  Compressed,
+# a definition costs between 24 bytes and two kilobytes -- the spread is that
+# wide because a language whose highlighting is a long word list or a long run
+# of regex rules does not compress against anything else in the pack.  Leaving
+# one out and recompressing gives its real price; the expensive end came out:
+#
+#   Assembly 2186   CSS 2028   Batch 1254   Lua 806   Perl 680   PHP 486
+#
+# against 24 for XML and 36 for SQL.  Assembly is every x86 mnemonic and CSS
+# is every property, so those two alone were a fifth of the embedded pack.
+# Nothing was dropped on those numbers: every one of these is a file a text
+# editor on Windows gets pointed at, and the two expensive ones were made
+# cheaper instead -- see the front coding in compress_packs.ps1 and the CSS
+# property list below.  The table is kept here as a price list, so that a
+# language added later is added knowing what it costs.
 CORE_LANGS = [
     "C", "C++", "C#", "Python", "JavaScript", "TypeScript", "Java", "Go",
     "Rust", "PHP", "Ruby", "Lua", "Perl", "Shell", "PowerShell", "Batch",
@@ -632,6 +648,32 @@ def fetch(dest):
             os.path.join(dest, "micro", "runtime", "syntax"))
 
 
+def read_pack(path):
+    """The documents in a pack, without its header comment."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    return [d for d in text.split("\n---\n")[1:]]
+
+
+def recore(out):
+    """Rebuild core.*.pack from the full packs already written.
+
+    Changing CORE_LANGS should not need the upstream repositories cloned
+    again: the full packs hold every definition the core set is chosen from,
+    and picking is all this does."""
+    langs  = read_pack(os.path.join(out, "syntax.pack"))
+    themes = read_pack(os.path.join(out, "themes.pack"))
+
+    core_langs, miss_l = pick(langs, CORE_LANGS)
+    core_themes, miss_t = pick(themes, CORE_THEMES)
+    write_pack(os.path.join(out, "core.syntax.pack"), core_langs)
+    write_pack(os.path.join(out, "core.themes.pack"), core_themes)
+    print("core:      %d languages, %d themes" % (len(core_langs), len(core_themes)))
+    for n in miss_l + miss_t:
+        print("    core wanted %r but the pack has no such name" % n)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--schemes", help="path to tinted-theming/schemes/base16")
@@ -639,7 +681,13 @@ def main():
     ap.add_argument("--out", default="assets", help="output directory")
     ap.add_argument("--fetch", action="store_true",
                     help="clone the sources into a temporary directory first")
+    ap.add_argument("--recore", action="store_true",
+                    help="rebuild only the core packs from the full packs "
+                         "already in --out, without touching the network")
     args = ap.parse_args()
+
+    if args.recore:
+        return recore(args.out)
 
     tmp = None
     if args.fetch:
