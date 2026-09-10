@@ -6,7 +6,9 @@
  */
 
 #include "note_syntax.h"
+#if NOTE_ENABLE_REGEX
 #include "note_regex.h"
+#endif
 
 /* ==========================================================================
  * Built-in definitions
@@ -57,6 +59,8 @@ static void split_pair(note_arena *ar, const nchar *v,
     if (*p) *close = note_arena_put(ar, p, -1);
 }
 
+#if NOTE_ENABLE_REGEX
+
 /* "operator \s+pattern" -> the kind and the expression that follows it. */
 static const struct { const nchar *name; unsigned char kind; } kRuleKinds[] = {
     { N("keyword"),  TOK_KEYWORD  },
@@ -93,22 +97,47 @@ static void add_rule(note_arena *ar, note_lang *L, const nchar *val)
     }
 }
 
+#endif  /* NOTE_ENABLE_REGEX */
+
 /* Defined with the rule cache further down.  The registry has to be able to
  * invalidate it, and the cache needs the registry's types, so the two are
  * declared here and defined there. */
+#if NOTE_ENABLE_REGEX
 static int g_nrules;
 static int g_rules_lang;
+#else
+/* The scanner asks how many rules are live in one place; with none compiled
+ * in, that question has a constant answer and the branch it guards folds. */
+#define g_nrules 0
+#endif
 
 int note_syntax_add(note_arena *ar, const nchar *text)
 {
-    nchar key[64], val[4096];
+    /* The value buffer has to hold the longest line a definition can carry,
+     * which is a keyword list: NOTE_CONF_VALUE_MAX names that so a port with
+     * a smaller stack can shrink it rather than patch this line.
+     *
+     * Static, not automatic.  At the desktop bound of 4096 and two bytes to
+     * an nchar that is an eight-kilobyte frame, and the Windows build links
+     * without a C runtime and so compiles with stack probes off -- there is
+     * no __chkstk to walk the guard page down as the frame is claimed.  A
+     * frame larger than a page then steps clean over the guard and the stack
+     * never grows: Windows 95 faults in the prologue, before a line of this
+     * function runs.  It went unseen until the packs became readable there,
+     * because nothing had ever reached this function on that machine.
+     *
+     * Nothing here recurses and definitions are registered one at a time, so
+     * the only thing given up is re-entrancy nobody wants -- which is the
+     * same trade console_main.c already makes with #pragma static-locals for
+     * the same buffer on the 6502. */
+    static nchar key[64], val[NOTE_CONF_VALUE_MAX];
     const nchar *p = text;
     note_lang L;
     int i, slot = -1;
 
     for (i = 0; i < (int)sizeof(L); i++) ((unsigned char *)&L)[i] = 0;
 
-    while (note_conf_next(&p, key, 64, val, 4096)) {
+    while (note_conf_next(&p, key, 64, val, NOTE_CONF_VALUE_MAX)) {
         if      (n_eq(key, N("name")))          L.name         = note_arena_put(ar, val, -1);
         else if (n_eq(key, N("extensions")))    L.exts         = note_arena_put(ar, val, -1);
         else if (n_eq(key, N("keywords")))      L.keywords     = note_arena_put(ar, val, -1);
@@ -116,7 +145,9 @@ int note_syntax_add(note_arena *ar, const nchar *text)
         else if (n_eq(key, N("line_comment")))  L.line_comment = note_arena_put(ar, val, -1);
         else if (n_eq(key, N("quotes")))        L.quotes       = note_arena_put(ar, val, -1);
         else if (n_eq(key, N("block_comment"))) split_pair(ar, val, &L.block_open, &L.block_close);
+#if NOTE_ENABLE_REGEX
         else if (n_eq(key, N("rule")))          add_rule(ar, &L, val);
+#endif
         else if (n_eq(key, N("preproc")))   { if (note_conf_bool(val)) L.flags |= SYN_PREPROC;  }
         else if (n_eq(key, N("tags")))      { if (note_conf_bool(val)) L.flags |= SYN_TAGS;     }
         else if (n_eq(key, N("headings")))  { if (note_conf_bool(val)) L.flags |= SYN_HEADINGS; }
@@ -136,10 +167,47 @@ int note_syntax_add(note_arena *ar, const nchar *text)
     g_langs[slot] = L;
 
     /* Replacing a language invalidates any rules compiled from the old one. */
+#if NOTE_ENABLE_REGEX
     if (slot == g_rules_lang) g_rules_lang = -1;
+#endif
 
     return slot;
 }
+
+#if NOTE_EMBEDDED_PACKS
+/* One definition out of a pack, without ever holding the pack.
+ *
+ * note_syntax_add() wants a definition as text, and the obvious way to get one
+ * out of a compiled-in pack is to decompress all 45 KB and split it -- which
+ * is what a backend with a language picker still does, because the picker
+ * lists what the registry holds.  A backend without one wants only the
+ * language of the file being opened, and on the 16-bit MS-DOS build "hold 45
+ * KB" is not a cost, it is an impossibility: the whole document space is 28
+ * KB.  So this streams the pack, copies out the single definition claiming the
+ * extension, and registers that.
+ *
+ * The scratch buffer is the caller's because this has no business deciding how
+ * much of a small machine's memory to hold: it need only be as large as the
+ * biggest definition, not the pack, and the shipped languages reach 6,373
+ * characters against 39,305 for all of them together.
+ */
+int note_syntax_add_from_pack(note_arena *ar, const unsigned char *blob,
+                              unsigned long len, const nchar *path,
+                              nchar *scratch, long cap)
+{
+    const nchar *base = note_basename(path);
+    const nchar *dot = 0, *p;
+
+    for (p = base; *p; p++) if (*p == (nchar)'.') dot = p;
+    if (!dot || !dot[1]) return -1;
+
+    if (note_pack_find(blob, len, "extensions", dot + 1, NOTE_PACK_WORD,
+                       scratch, cap) <= 0)
+        return -1;
+
+    return note_syntax_add(ar, scratch);
+}
+#endif  /* NOTE_EMBEDDED_PACKS */
 
 /* The built-in definitions are stored a byte per character and widened here.
  * They are pure ASCII, so as wide literals they were exactly twice the size
@@ -173,8 +241,10 @@ void note_syntax_init(note_arena *ar)
     g_nlangs = 1;                       /* LANG_NONE */
 
     /* Indices are handed out afresh, so a cache keyed on one is now stale. */
+#if NOTE_ENABLE_REGEX
     g_rules_lang = -1;
     g_nrules     = 0;
+#endif
 
     for (i = 0; note_builtin_syntax[i]; i++)
         note_syntax_add(ar, note_syntax_widen(note_builtin_syntax[i]));
@@ -262,6 +332,8 @@ static int chr_in(const nchar *set, nchar c)
  * allowed to break the whole language.
  * -------------------------------------------------------------------------- */
 
+#if NOTE_ENABLE_REGEX
+
 typedef struct {
     note_regex    re;
     unsigned char kind;
@@ -333,6 +405,8 @@ static int rules_at(const nchar *text, int len, int at, int *out_len)
     return (int)g_rules[best].kind;
 }
 
+#endif  /* NOTE_ENABLE_REGEX */
+
 /* Does text[i..] start with s?  Declared here because the safe-start scan
  * below needs it and it is defined with the lexer further down. */
 static int starts(const nchar *text, int len, int i, const nchar *s);
@@ -388,30 +462,118 @@ int note_syntax_safe_start(int lang, const nchar *text, int len,
     return floor_at == 0 ? 0 : line_start_at(text, floor_at);
 }
 
+/* --------------------------------------------------------------------------
+ * The two constructs that survive a line break.
+ *
+ * Both are consumed the same way whether the scanner has just met the opener
+ * or is resuming one from a previous run, so each is a function rather than a
+ * loop written twice.  `open` says the run ended before the closing
+ * delimiter, which is exactly the condition the end state records.
+ * -------------------------------------------------------------------------- */
+
+static int scan_block(const note_lang *L, const nchar *text, int len,
+                      int i, int *open)
+{
+    int k;
+    while (i < len) {
+        k = starts(text, len, i, L->block_close);
+        if (k) { *open = 0; return i + k; }
+        i++;
+    }
+    *open = 1;
+    return i;
+}
+
+static int scan_string(const nchar *text, int len, int i, nchar q, int *open)
+{
+    *open = 0;
+    while (i < len) {
+        /* A backslash escapes whatever follows, a line break included: that
+         * is how a string continues onto the next line, and why a run has to
+         * carry its terminators. */
+        if (text[i] == (nchar)'\\' && i + 1 < len) { i += 2; continue; }
+        if (text[i] == q) return i + 1;
+        /* An unterminated quote must not run past its line, or one stray
+         * apostrophe would colour the rest of the file. */
+        if (is_eol(text[i]) && q != (nchar)'`') return i;
+        i++;
+    }
+    *open = 1;
+    return i;
+}
+
+/* A string's state carries its quote as an index into the language's `quotes`
+ * rather than as the character itself, so the whole state stays one byte on a
+ * build where nchar is two. */
+static nchar quote_of(const note_lang *L, note_syn_state st)
+{
+    int idx = (int)st - NOTE_SYN_STRING;
+    int i;
+    if (idx < 0 || !L->quotes) return 0;
+    for (i = 0; L->quotes[i]; i++)
+        if (i == idx) return L->quotes[i];
+    return 0;
+}
+
+static note_syn_state state_of_quote(const note_lang *L, nchar q)
+{
+    int i;
+    if (!L->quotes) return NOTE_SYN_NORMAL;
+    for (i = 0; L->quotes[i] && i < 250; i++)
+        if (L->quotes[i] == q) return (note_syn_state)(NOTE_SYN_STRING + i);
+    return NOTE_SYN_NORMAL;
+}
+
 #define EMIT(s, l, k)                                    \
     do {                                                 \
-        if (n >= max) return n;                          \
-        if ((l) > 0) {                                   \
+        if ((l) > 0 && n < max) {                        \
             out[n].start = base + (s);                   \
             out[n].len   = (l);                          \
             out[n].kind  = (unsigned char)(k);           \
             n++;                                         \
         }                                                \
+        if (n >= max && stop_full) goto done;            \
     } while (0)
 
-int note_tokenize(int lang, const nchar *text, int len, int base,
-                  note_span *out, int max)
+int note_tokenize_from(int lang, const nchar *text, int len, int base,
+                       note_span *out, int max,
+                       note_syn_state st, note_syn_state *end)
 {
     const note_lang *L = note_lang_get(lang);
     int i = 0, n = 0;
     int line_start = 1;
-    int nocase;
+    int nocase, open = 0;
+    /* A caller that wants the end state gets the whole run scanned even after
+     * the span array has filled, because a state derived from half a run is
+     * worse than none.  A caller that does not keeps the old cheap exit. */
+    int stop_full = (end == 0);
 
-    if (lang <= LANG_NONE || !L) return 0;
+    if (lang <= LANG_NONE || !L) {
+        if (end) *end = NOTE_SYN_NORMAL;
+        return 0;
+    }
     nocase = (L->flags & SYN_NOCASE) ? 1 : 0;
 
+#if NOTE_ENABLE_REGEX
     compile_rules(L, lang);
     rules_begin(text, len, 0);
+#endif
+
+    /* Pick up whatever the previous run left open.  Neither construct nests,
+     * so resuming one is meeting it with the opener already behind us. */
+    if (st == NOTE_SYN_BLOCK && L->block_open) {
+        i = scan_block(L, text, len, 0, &open);
+        EMIT(0, i, TOK_COMMENT);
+        line_start = 0;
+    } else if (st >= NOTE_SYN_STRING) {
+        nchar q = quote_of(L, st);
+        if (q) {
+            i = scan_string(text, len, 0, q, &open);
+            EMIT(0, i, TOK_STRING);
+            line_start = 0;
+        }
+    }
+    if (!open) st = NOTE_SYN_NORMAL;
 
     while (i < len) {
         nchar c = text[i];
@@ -444,35 +606,23 @@ int note_tokenize(int lang, const nchar *text, int len, int base,
             continue;
         }
         if (starts(text, len, i, L->block_open)) {
-            int k;
-            i += n_len(L->block_open);
-            while (i < len) {
-                k = starts(text, len, i, L->block_close);
-                if (k) { i += k; break; }
-                i++;
-            }
+            i = scan_block(L, text, len, i + n_len(L->block_open), &open);
+            if (open) st = NOTE_SYN_BLOCK;
             EMIT(start, i - start, TOK_COMMENT);
             continue;
         }
 
         /* Strings. */
         if (chr_in(L->quotes, c)) {
-            nchar q = c;
-            i++;
-            while (i < len) {
-                if (text[i] == (nchar)'\\' && i + 1 < len) { i += 2; continue; }
-                if (text[i] == q) { i++; break; }
-                /* An unterminated quote must not run past its line, or one
-                 * stray apostrophe would colour the rest of the file. */
-                if (is_eol(text[i]) && q != (nchar)'`') break;
-                i++;
-            }
+            i = scan_string(text, len, i + 1, c, &open);
+            if (open) st = state_of_quote(L, c);
             EMIT(start, i - start, TOK_STRING);
             continue;
         }
 
         /* Pattern rules.  Reached only outside comments and strings, which
          * consume their whole span, so those keep precedence over any rule. */
+#if NOTE_ENABLE_REGEX
         if (g_nrules) {
             int rlen = 0;
             int kind = rules_at(text, len, i, &rlen);
@@ -482,6 +632,7 @@ int note_tokenize(int lang, const nchar *text, int len, int base,
                 continue;
             }
         }
+#endif
 
         /* Markup tags: <tag, </tag, <?xml, and the closing >. */
         if ((L->flags & SYN_TAGS) && c == (nchar)'<') {
@@ -511,15 +662,142 @@ int note_tokenize(int lang, const nchar *text, int len, int base,
             int wlen;
             while (i < len && is_ident(text[i])) i++;
             wlen = i - start;
-            if (note_word_in_list(L->keywords, text + start, wlen, nocase))
-                EMIT(start, wlen, TOK_KEYWORD);
-            else if (note_word_in_list(L->types, text + start, wlen, nocase))
-                EMIT(start, wlen, TOK_TYPE);
+            /* A word can never change the state, so a run being scanned only
+             * for its end state can skip both list walks -- which is most of
+             * what a word costs. */
+            if (max > 0) {
+                if (note_word_in_list(L->keywords, text + start, wlen, nocase))
+                    EMIT(start, wlen, TOK_KEYWORD);
+                else if (note_word_in_list(L->types, text + start, wlen, nocase))
+                    EMIT(start, wlen, TOK_TYPE);
+            }
             continue;
         }
 
         i++;
     }
 
+done:
+    if (end) *end = st;
     return n;
 }
+
+int note_tokenize(int lang, const nchar *text, int len, int base,
+                  note_span *out, int max)
+{
+    return note_tokenize_from(lang, text, len, base, out, max,
+                              NOTE_SYN_NORMAL, 0);
+}
+
+note_syn_state note_syntax_advance(int lang, const nchar *text, int len,
+                                   note_syn_state st)
+{
+    note_syn_state end = NOTE_SYN_NORMAL;
+    note_tokenize_from(lang, text, len, 0, 0, 0, st, &end);
+    return end;
+}
+
+#if NOTE_LINE_CHECKPOINTS
+/* The sparse checkpoint table answers "what state does line N start in"
+ * for a document far too large to keep a state per line.  A machine that
+ * cannot hold such a document does not need the machinery either -- and on
+ * a 6502 it is a kilobyte of code that would never earn its place.  The
+ * resumable lexer itself, note_tokenize_from and note_syntax_advance, is
+ * in both profiles: that is the part every backend wants. */
+/* ==========================================================================
+ * Checkpoints
+ * ========================================================================== */
+
+void note_syn_ckpts_init(note_syn_ckpts *t, note_syn_state *slots, int cap)
+{
+    t->slots = slots;
+    t->cap   = cap > 0 ? cap : 0;
+    t->every = 1;
+    t->valid = 0;
+    if (t->cap > 0) { slots[0] = NOTE_SYN_NORMAL; t->valid = 1; }
+}
+
+void note_syn_ckpts_fit(note_syn_ckpts *t, int lines)
+{
+    if (t->cap <= 0) return;
+
+    /* Doubling rather than dividing out the exact spacing is what lets the
+     * work already done survive: with K twice what it was, every second slot
+     * of the old table sits on a line the new one still checkpoints, so the
+     * table compacts in place instead of being thrown away on every growth
+     * spurt of the document. */
+    while (lines / t->every >= t->cap && t->every < 16384) {
+        int i;
+        for (i = 0; i * 2 < t->valid; i++) t->slots[i] = t->slots[i * 2];
+        t->valid = (t->valid + 1) / 2;
+        t->every *= 2;
+    }
+}
+
+void note_syn_ckpts_dirty(note_syn_ckpts *t, int line)
+{
+    int keep;
+    if (line < 0) line = 0;
+    keep = line / t->every + 1;      /* checkpoints at or before `line` hold */
+    if (t->valid > keep) t->valid = keep;
+}
+
+int note_syn_ckpts_state(const note_syn_ckpts *t, int line, note_syn_state *st)
+{
+    int i;
+    if (line < 0) line = 0;
+    i = line / t->every;
+    if (i >= t->valid) i = t->valid - 1;
+    if (i < 0) { *st = NOTE_SYN_NORMAL; return 0; }
+    *st = t->slots[i];
+    return i * t->every;
+}
+
+void note_syn_ckpts_record(note_syn_ckpts *t, int line, note_syn_state st)
+{
+    int i;
+    if (line < 0 || line % t->every) return;
+    i = line / t->every;
+    if (i >= t->cap) return;
+    if (i < t->valid) { t->slots[i] = st; return; }
+    if (i == t->valid) { t->slots[i] = st; t->valid = i + 1; }
+}
+
+note_syn_state note_syn_ckpts_scan(note_syn_ckpts *t, int lang,
+                                   const nchar *text, int len,
+                                   int first_line, note_syn_state st)
+{
+    int i = 0, line = first_line;
+
+    note_syn_ckpts_record(t, line, st);
+
+    while (i < len) {
+        int seg = i, whole = 0;
+
+        /* Advance to the next line that carries a checkpoint, then hand that
+         * whole stretch to the lexer in one call.  Splitting per line instead
+         * would run every pattern rule against every line separately, which
+         * costs far more than the states are worth. */
+        do {
+            while (i < len && !is_eol(text[i])) i++;
+            whole = (i < len);
+            if (whole) {
+                if (text[i] == (nchar)'\r' && i + 1 < len &&
+                    text[i + 1] == (nchar)'\n') i++;
+                i++;
+                line++;
+            }
+        } while (i < len && (line % t->every));
+
+        note_tokenize_from(lang, text + seg, i - seg, 0, 0, 0, st, &st);
+
+        /* A run that stopped in the middle of a line -- the end of a chunk,
+         * or a file with no final break -- has no line start to name, so it
+         * records nothing and the next chunk carries the state on. */
+        if (whole) note_syn_ckpts_record(t, line, st);
+    }
+
+    return st;
+}
+
+#endif  /* NOTE_LINE_CHECKPOINTS */
