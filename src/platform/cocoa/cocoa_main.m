@@ -220,15 +220,52 @@ static const note_accel *accel_for(int id)
  * Building the menus
  * ========================================================================== */
 
+/* Cut, Copy, Paste and Delete belong to whatever is focused, not to the
+ * document the core is holding -- and note_accels says so by leaving all four
+ * out of the shortcut table.  Left at that, though, they had no shortcut at
+ * all: the menu item was note's own command with no key equivalent, so
+ * Command-C did nothing anywhere, in the editor as much as in a text field.
+ *
+ * Giving them the standard selectors with a nil target hands them back to the
+ * responder chain, which is where AppKit looks for them: the editor answers
+ * when the editor is focused, the find field when it is, and the item greys
+ * itself out through the responder's own validation rather than ours.  The
+ * core still routes the same four through note_command when something else
+ * asks for them, which is why h_edit_op stays as it is.
+ */
+static SEL standard_edit_action(int cmd, NSString **key)
+{
+    *key = @"";
+    switch (cmd) {
+    case CMD_EDIT_CUT:    *key = @"x"; return @selector(cut:);
+    case CMD_EDIT_COPY:   *key = @"c"; return @selector(copy:);
+    case CMD_EDIT_PASTE:  *key = @"v"; return @selector(paste:);
+    case CMD_EDIT_DELETE:              return @selector(delete:);
+    }
+    return NULL;
+}
+
 static NSMenuItem *menu_item(const note_menu_item *it, id target)
 {
-    NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:menu_label(it->label)
-                                                   action:@selector(noteCommand:)
-                                            keyEquivalent:@""] autorelease];
+    NSString *stdkey = nil;
+    SEL std = standard_edit_action(it->id, &stdkey);
     const note_accel *acc = accel_for(it->id);
+    NSMenuItem *item;
     NSString *key = nil;
     NSEventModifierFlags mods = 0;
 
+    if (std) {
+        item = [[[NSMenuItem alloc] initWithTitle:menu_label(it->label)
+                                           action:std
+                                    keyEquivalent:stdkey] autorelease];
+        [item setTag:it->id];
+        [item setTarget:nil];
+        return item;
+    }
+
+    item = [[[NSMenuItem alloc] initWithTitle:menu_label(it->label)
+                                       action:@selector(noteCommand:)
+                                keyEquivalent:@""] autorelease];
     [item setTag:it->id];
     [item setTarget:target];
 
@@ -385,10 +422,55 @@ static int key_matches(NSEvent *e, const note_accel *a)
     return [[typed lowercaseString] isEqualToString:[key lowercaseString]];
 }
 
+/* An editing shortcut typed into one of note's own panels belongs to the
+ * field it was typed into, not to the document behind it.
+ *
+ * The monitor below sees every key the application gets, whichever window is
+ * in front, and note_accels claims Select All and Undo for the core -- so
+ * Command-A in the Find panel selected the whole file and left the search box
+ * alone.  Handing the event back is not enough either: the menu bar would
+ * then dispatch the very same command out of the very same table.  So when
+ * the key window is a panel rather than the editor's window, the two are sent
+ * to the first responder as the standard actions they are, and whatever is
+ * focused there -- the find field, the replace field, the key sheet --
+ * answers them itself.
+ *
+ * Cut, Copy and Paste are not here because they never needed to be: they are
+ * the responder chain's everywhere, from the Edit menu (see menu_item), and a
+ * panel's field editor is in that chain already.
+ *
+ * Everything else in the table still works from a panel: Command-S is still
+ * save and F3 is still find-again, because neither is a thing a text field
+ * has an opinion about.
+ */
+static int panel_edit_key(NSEvent *e)
+{
+    NSWindow *key = [NSApp keyWindow];
+    NSString *ch;
+    SEL sel = NULL;
+
+    if (!key || key == (NSWindow *)g.window) return 0;
+    if (!([e modifierFlags] & NSEventModifierFlagCommand)) return 0;
+
+    ch = [[e charactersIgnoringModifiers] lowercaseString];
+    if      ([ch isEqualToString:@"a"]) sel = @selector(selectAll:);
+    else if ([ch isEqualToString:@"z"]) sel = ([e modifierFlags] & NSEventModifierFlagShift)
+                                            ? @selector(redo:) : @selector(undo:);
+    if (!sel) return 0;
+
+    /* to:nil is what makes this the responder chain's answer rather than
+     * ours: the field editor takes it if it can, and if nothing in the chain
+     * can, nothing happens -- which is still the right answer, because the
+     * document behind a panel is not what was being edited. */
+    [NSApp sendAction:sel to:nil from:nil];
+    return 1;
+}
+
 static NSEvent *note_key(NSEvent *e)
 {
     int i;
 
+    if (panel_edit_key(e)) return nil;
     if (g.pal_open) return pal_key(&g, e) ? nil : e;
 
     for (i = 0; i < note_accel_count; i++) {
