@@ -942,19 +942,23 @@ void note_defs_load(note_app *a)
             /* Packs first, then loose files, so a definition a user drops in
              * beside a pack replaces the pack's copy of the same name. */
             n_copy(sub, dir, NOTE_PATH_MAX);
-            n_cat (sub, N("\\syntax.pack"), NOTE_PATH_MAX);
+            n_cat (sub, NOTE_SEP, NOTE_PATH_MAX);
+            n_cat (sub, N("syntax.pack"), NOTE_PATH_MAX);
             load_pack(a, sub, note_syntax_add, &g_arena);
 
             n_copy(sub, dir, NOTE_PATH_MAX);
-            n_cat (sub, N("\\themes.pack"), NOTE_PATH_MAX);
+            n_cat (sub, NOTE_SEP, NOTE_PATH_MAX);
+            n_cat (sub, N("themes.pack"), NOTE_PATH_MAX);
             load_pack(a, sub, note_theme_add, &g_arena);
 
             n_copy(sub, dir, NOTE_PATH_MAX);
-            n_cat (sub, N("\\syntax"), NOTE_PATH_MAX);
+            n_cat (sub, NOTE_SEP, NOTE_PATH_MAX);
+            n_cat (sub, N("syntax"), NOTE_PATH_MAX);
             load_defs_from(a, sub, N("syntax"), note_syntax_add, &g_arena);
 
             n_copy(sub, dir, NOTE_PATH_MAX);
-            n_cat (sub, N("\\themes"), NOTE_PATH_MAX);
+            n_cat (sub, NOTE_SEP, NOTE_PATH_MAX);
+            n_cat (sub, N("themes"), NOTE_PATH_MAX);
             load_defs_from(a, sub, N("theme"), note_theme_add, &g_arena);
         }
     }
@@ -997,7 +1001,7 @@ static void session_path(note_app *a, nchar *buf, int cap,
     nchar num[12];
     buf[0] = 0;
     if (!a->ops->state_dir(a->host, buf, cap)) return;
-    n_cat(buf, N("\\"), cap);
+    n_cat(buf, NOTE_SEP, cap);
     if (id) {
         n_cat(buf, N("buf"), cap);
         n_utoa(id, num);
