@@ -44,7 +44,19 @@ const note_theme *chrome_theme(note_host *h)
  * The gutter
  * ========================================================================== */
 
-@implementation NoteRuler
+/* How many lines one checkpoint of the gutter's line index stands for.  Small
+ * enough that the scan after a checkpoint is nothing, large enough that a
+ * million-line document is a few thousand offsets. */
+#define CK_SPAN 256
+
+@implementation NoteRuler {
+    /* Character offsets of the starts of lines 1 + (k+1)*CK_SPAN, in order;
+     * `ck_valid` is how far into the text they have been worked out, and
+     * `ck_line` the line number at that point. */
+    NSMutableData *ck;
+    NSUInteger     ck_valid;
+    NSUInteger     ck_line;
+}
 
 - (CGFloat)wantedThickness
 {
@@ -55,17 +67,126 @@ const note_theme *chrome_theme(note_host *h)
     return w < 34.0 ? 34.0 : w;
 }
 
-/* The number beside a line is the number of line breaks above it, so the only
- * thing that has to be counted is the text before the top of the screen --
- * once per draw, not once per line. */
+/* The number beside a line is the number of line breaks above it, and counting
+ * them from the start of the document is fine until the document is large: at
+ * the bottom of a fifty-thousand-line file that is three million characters
+ * scanned, and it is scanned again for every pixel scrolled -- eight
+ * milliseconds of every frame, spent on a number.
+ *
+ * The core answers the same question with a sparse index: note_buffer keeps a
+ * checkpoint every so many lines and scans only the run after the nearest one
+ * (note_buffer.h).  What it cannot do here is answer it for this text -- the
+ * core's index indexes a note_buffer, and a backend built on a native control
+ * has no note_buffer, because the text belongs to the control.  So what is
+ * borrowed is the shape, not the code: checkpoints into the NSString, laid
+ * down as the view reaches further down and cut back to the edit when the
+ * text changes.
+ */
+- (void)resetLineIndex
+{
+    if (!ck) ck = [[NSMutableData alloc] init];
+    [ck setLength:0];
+    ck_valid = 0;
+    ck_line  = 1;
+}
+
+/* Text before an edit is still where it was, so the checkpoints that sit
+ * before it survive; everything from the edit on is unknown again. */
+- (void)invalidateLinesFrom:(NSUInteger)idx
+{
+    const NSUInteger *marks;
+    NSUInteger n, keep = 0;
+
+    if (!ck) { [self resetLineIndex]; return; }
+    marks = (const NSUInteger *)[ck bytes];
+    n = [ck length] / sizeof(NSUInteger);
+    while (keep < n && marks[keep] < idx) keep++;
+    [ck setLength:keep * sizeof(NSUInteger)];
+    ck_valid = keep ? ((const NSUInteger *)[ck bytes])[keep - 1] : 0;
+    ck_line  = 1 + keep * CK_SPAN;
+}
+
+/* Walks the text from where the index stops to `idx`, dropping a checkpoint
+ * every CK_SPAN lines.  Only ever moves forward: scrolling back up finds the
+ * answer in checkpoints already laid down. */
+- (void)extendIndexTo:(NSUInteger)idx inString:(NSString *)s
+{
+    CFStringInlineBuffer buf;
+    NSUInteger i, line = ck_line, from = ck_valid;
+    NSUInteger have = [ck length] / sizeof(NSUInteger);
+
+    if (idx <= ck_valid) return;
+    CFStringInitInlineBuffer((__bridge CFStringRef)s, &buf,
+                             CFRangeMake((CFIndex)from, (CFIndex)(idx - from)));
+    for (i = from; i < idx; i++) {
+        if (CFStringGetCharacterFromInlineBuffer(&buf, (CFIndex)(i - from)) != '\n')
+            continue;
+        line++;
+        if ((line - 1) % CK_SPAN == 0 && (line - 1) / CK_SPAN == have + 1) {
+            NSUInteger off = i + 1;
+            [ck appendBytes:&off length:sizeof(off)];
+            have++;
+        }
+    }
+    ck_valid = idx;
+    ck_line  = line;
+}
+
 - (NSUInteger)lineAtIndex:(NSUInteger)idx inString:(NSString *)s
 {
     CFStringInlineBuffer buf;
-    NSUInteger i, line = 1;
-    CFStringInitInlineBuffer((__bridge CFStringRef)s, &buf, CFRangeMake(0, (CFIndex)idx));
-    for (i = 0; i < idx; i++)
-        if (CFStringGetCharacterFromInlineBuffer(&buf, (CFIndex)i) == '\n') line++;
+    const NSUInteger *marks;
+    NSUInteger n, lo, hi, from, line, i;
+
+    if (!ck) [self resetLineIndex];
+    if (idx > ck_valid) [self extendIndexTo:idx inString:s];
+
+    marks = (const NSUInteger *)[ck bytes];
+    n = [ck length] / sizeof(NSUInteger);
+    lo = 0; hi = n;
+    while (lo < hi) {                       /* last checkpoint at or before idx */
+        NSUInteger mid = lo + (hi - lo) / 2;
+        if (marks[mid] <= idx) lo = mid + 1; else hi = mid;
+    }
+    from = lo ? marks[lo - 1] : 0;
+    line = 1 + lo * CK_SPAN;
+
+    CFStringInitInlineBuffer((__bridge CFStringRef)s, &buf,
+                             CFRangeMake((CFIndex)from, (CFIndex)(idx - from)));
+    for (i = from; i < idx; i++)
+        if (CFStringGetCharacterFromInlineBuffer(&buf, (CFIndex)(i - from)) == '\n')
+            line++;
     return line;
+}
+
+/* The index is only right for the text it was built over, so the gutter
+ * follows its own text view: a new client starts a new index, and an edit in
+ * the current one cuts the index back to where the edit happened. */
+- (void)setClientView:(NSView *)view
+{
+    NSView *was = [self clientView];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    if ([was isKindOfClass:[NSTextView class]])
+        [nc removeObserver:self name:NSTextStorageDidProcessEditingNotification
+                    object:[(NSTextView *)was textStorage]];
+    [super setClientView:view];
+    [self resetLineIndex];
+    if ([view isKindOfClass:[NSTextView class]])
+        [nc addObserver:self selector:@selector(textEdited:)
+                   name:NSTextStorageDidProcessEditingNotification
+                 object:[(NSTextView *)view textStorage]];
+}
+
+/* Colouring the screen edits attributes and nothing else, and that happens on
+ * every keystroke and every scroll -- so the mask is what decides, not the
+ * notification. */
+- (void)textEdited:(NSNotification *)note
+{
+    NSTextStorage *ts = (NSTextStorage *)[note object];
+
+    if (([ts editedMask] & NSTextStorageEditedCharacters) == 0) return;
+    [self invalidateLinesFrom:[ts editedRange].location];
 }
 
 /* Why the ruler draws itself rather than letting NSRulerView do the framing.
