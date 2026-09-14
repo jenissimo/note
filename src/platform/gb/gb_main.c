@@ -1,6 +1,7 @@
 /* gb_main.c -- note for the Game Boy.
  *
- * See docs/gameboy.md for the reasoning; this is the part of it that runs.
+ * The design note behind this lives outside the repo; what follows is the
+ * part of it that runs.
  *
  * The screen is the interesting half.  A Game Boy shows 20x18 tiles of 8x8,
  * which is 20 columns of text, which is not an editor.  So the tilemap here is

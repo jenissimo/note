@@ -39,3 +39,6 @@ __pycache__/
 # the only compiler still emitting 16-bit real-mode code, and it arrives as a
 # 145 MB download; that belongs in a download too, not in git.
 /tools/watcom/
+
+# Design notes and stand instructions, kept locally rather than published.
+/docs/

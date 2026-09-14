@@ -7,21 +7,38 @@ light/dark themes — with the editing itself done by the platform's own native
 text control rather than a reimplementation of one.
 
 ```
-build\note.exe            ~62 KB
+build\win32\note.exe      155 KB   x86, the default
+build\win32\note.min.exe  113 KB   the same binary, UPX-compressed
 ```
+
+That is one file with two programs in it. The PE is the Windows editor; the
+MZ stub at the front of it — the real-mode program that normally does nothing
+but print *This program cannot be run in DOS mode* -- is a 16-bit editor that
+runs on MS-DOS. The same `note.exe` starts on MS-DOS, on Windows 95 and on
+Windows 11. See [One file, two editors](#one-file-two-editors).
 
 ## Building
 
 Needs Visual Studio 2022 with the C++ toolset. From a shell in the repo root:
 
 ```
-build.bat            REM x64 (default)
-build.bat x86
+build.bat            REM x86, the default
+build.bat x64
+build.bat own        REM the owner-drawn text view instead of RICHEDIT
 ```
 
-The result lands in `build\`, together with the definition packs. Nothing else
-is required at runtime: the binary links no CRT and imports only system DLLs
-plus `Msftedit.dll`.
+x86 by default because it is smaller for the same sources — 156 KB against
+180 — and a text editor has no use for a 64-bit address space. `own` builds
+`win32_view.c`, note's own text window over the core's gap buffer, instead of
+the RICHEDIT control; it is the same buffer the MS-DOS, C64 and Game Boy ports
+edit, and it is built alongside the shipped path rather than in place of it, so
+the two can be compared while the view matures.
+
+The result lands in `build\win32\`, together with the syntax pack. Nothing
+else is required at runtime: the binary links no CRT and imports only system
+DLLs plus `Msftedit.dll`. The fourteen curated themes are inside the
+executable; the other 324 are `assets/themes.pack` in this repo, and dropping
+that file into the folder note already searches loads every one of them.
 
 The build also copies the executable to `%LOCALAPPDATA%\Microsoft\WindowsApps`
 so `note` works from any shell. That directory is where Windows keeps app
@@ -55,6 +72,9 @@ src/core/          no OS headers, no CRT, C89 throughout
   note_regex.*       a Pike VM, for the lexer's pattern rules and for Find
   note_theme.*       palette registry
   note_palette.*     the command palette's rows and its filtering
+  note_buffer.*      a gap buffer with its own undo log and line index
+  note_pack.*        finding one definition inside a pack without parsing it
+  note_reduce.*      fitting a theme onto a fixed hardware palette
 src/platform/win32/
   note_win32.h       the state and types the backend shares across its parts
   win32_main.c       the window, the message loop, startup
@@ -65,6 +85,12 @@ src/platform/win32/
   win32_chrome.c     tabs, the status bar, applying a theme
   win32_dialogs.c    the system dialogs: open, save, font, print
   win32_host.c       files, folders, the clock — the plain services
+src/platform/console/
+  console_main.c     one source for MS-DOS, 16-bit MS-DOS and the Commodore 64
+  font_terminus.h    a VGA character set the DOS build uploads at startup
+src/platform/gb/
+  gb_main.c          the Game Boy: 40 columns on a 160x144 screen
+  gb_basic.*         a tokenising BASIC, because a ROM cannot load a compiler
 ```
 
 The backend was one file until it passed three and a half thousand lines, at
@@ -94,11 +120,12 @@ The core is strict C89 with no CRT, no floating point and no assumption that
 `note_config.h` rather than scattered through the code. `NOTE_PROFILE_TINY`
 selects a small profile with one document, no session and no syntax tables.
 
-That leaves the door open to machines with a few tens of kilobytes, but does
-not by itself open it: the text-control operations currently assume a native
-widget owns the buffer. A DOS or 6502 backend would first need a `note_buffer`
-in the core — a gap buffer with selection and undo — implementing those
-operations itself, after which such a backend is mostly drawing.
+That is what opened the door to machines with a few tens of kilobytes, and
+`note_buffer.c` is what walked through it: a gap buffer with selection, undo
+and a line index, which the backends with no native text control own
+themselves. Four of them now do — 32-bit MS-DOS, 16-bit MS-DOS, the
+Commodore 64 and the Game Boy — and past that buffer such a backend is
+mostly drawing.
 
 ## Definitions
 
@@ -187,8 +214,10 @@ construct it lacks — those languages lose one pattern each, not the language.
 
 ## MS-DOS and the Commodore 64
 
-The same editor builds for two machines that predate every API the Windows
-version talks to:
+The first two of the four backends that predate every API the Windows version
+talks to. Both are 32-bit-or-nothing in their own way: DJGPP needs a DPMI host,
+cc65 needs a 6502. The other two, the 16-bit DOS arm and the Game Boy, have
+sections of their own below.
 
 ```
 build-retro.bat          REM both
@@ -253,32 +282,123 @@ the editor above the BASIC area or copying the tokenised program down through a
 trampoline in memory neither program owns. Either is real work, and a Run that
 overwrote the editor mid-copy would be worse than none.
 
-## Tests
-
-Both test programs are host programs and may use the CRT; the code they test
-may not. Build and run either with, for example:
+## One file, two editors
 
 ```
-cl /nologo /W4 /TC tests\test_syntax.c src\core\note_syntax.c ^
-   src\core\note_conf.c src\core\note_regex.c
+build-dos16.bat
+build\dos16\note16.exe   39 KB    Open Watcom, 8086 real mode, small model
+```
+
+Every PE begins with an MZ header describing a real-mode program, and in every
+other executable on the machine that program prints one line and exits. It does
+not have to. `note16.exe` is 8086 code in the small model, small enough and
+plain enough to be the `/STUB:` image of `build\win32\note.exe`, so the same
+file is a Windows editor to Windows and a DOS editor to DOS. That is also why
+the Windows binary targets subsystem version 4.00: a PE that claims to need a
+later Windows is refused by Windows 95 before any of this matters.
+
+What the 16-bit arm gives up against the DJGPP one is the uploadable font and
+the room a single 64 KB data segment does not have. What it gains is that it
+runs on an 8086 with no DPMI host, which is the only way the stub trick works
+at all.
+
+The curated themes ride at the end of the file rather than in `.rsrc`, past the
+last section, and both halves find them by the same rule: the last `NPK1` magic
+in the last 64 KB. A resource directory is no use to a real-mode program — it
+cannot walk one and cannot run the loader that would expand it — but it can
+open its own file and seek.
+
+Open Watcom is the only compiler still emitting 16-bit real-mode code.
+`tools\setup_watcom.ps1` downloads it into `tools\watcom\`; set `NOTE_WATCOM`
+to build against another install.
+
+## The Game Boy
+
+```
+build-gb.bat
+build\gb\note.gb         32 KB    GBDK-2020 and SDCC
+```
+
+A text editor on a machine with eight buttons, 8 KB of RAM and a 160x144
+screen — 20 tiles across, half of what a line of text needs. It draws 40
+columns by giving each character half a tile and composing the pairs at
+runtime, and it takes text in through an on-screen keyboard, because with eight
+buttons there is no other way in.
+
+It also carries a small tokenising BASIC (`gb_basic.c`): keywords are stored as
+single bytes, which is what makes a program fit in the few kilobytes a
+cartridge's battery-backed SRAM has, and is the reason a `Run` exists here and
+not on the C64 — on the Game Boy the interpreter is note's own and knows
+where it put things.
+
+`tools\setup_gb.ps1` downloads GBDK-2020 into `tools\gbdk-2020\`; it carries
+its own SDCC. `tools\run_gb.ps1` starts the ROM in an emulator.
+
+## Emulator stands
+
+The retro targets are checked without a person watching a screen, which needs a
+machine a script can start, type into and photograph:
+
+```
+tools\run_retro.ps1 dos demo.txt     DOSBox-X
+tools\run_retro.ps1 c64              VICE
+tools\run_v86.ps1                    v86 in a browser, FreeDOS
+tools\qemu95.ps1                     QEMU, Windows 95
+tools\run_gb.ps1                     a Game Boy emulator
+```
+
+Nothing here downloads an operating system that is not free to redistribute.
+The v86 and QEMU stands boot a Windows 95 image *you* supply; `setup` says
+where to put one and stops if it is missing. `tools/v86/`, `tools/qemu95/`,
+`tools/gbdk-2020/` and `tools/watcom/` are installed into the tree by their own
+setup scripts and none of them is committed — they are hundreds of megabytes
+of prebuilt binaries, and in the Windows case not ours to ship.
+
+## Tests
+
+Six programs, one per thing worth being sure of. They are host programs and may
+use the CRT; the code they test may not. Each is a `cl` line and an executable,
+so there is nothing to install and nothing to configure:
+
+```
+cl /nologo /W4 /TC tests\test_buffer.c  src\core\note_buffer.c
+cl /nologo /W4 /TC tests\test_regex.c   src\core\note_regex.c
+cl /nologo /W4 /TC tests\test_pack.c    src\core\note_pack.c
+cl /nologo /W4 /TC tests\test_reduce.c  src\core\note_reduce.c
+cl /nologo /W4 /TC tests\test_gbbasic.c src\platform\gb\gb_basic.c
+cl /nologo /W4 /TC tests\test_syntax.c  src\core\note_syntax.c ^
+   src\core\note_conf.c src\core\note_regex.c src\core\note_pack.c
+```
+
+`test_buffer` covers the gap buffer the console ports edit with — insertion
+and deletion at every position, undo grouping, the line index across edits,
+search with wrapping and whole-word matching, and filling the buffer to
+capacity to check that it refuses further text without corrupting what is
+already there. It finishes by timing an edit against document size, which is
+how "a 10 MB file still types in microseconds" stays a fact rather than a
+claim.
+
+`test_regex` covers the engine: every syntax construct, capture offsets,
+malformed patterns, and a pathological `(a+)+b` that must stay fast.
+
+`test_syntax` covers the registry and the lexer, and finishes on the shipped
+pack, which it needs as an argument:
+
+```
 test_syntax.exe assets\syntax.pack
 ```
 
-`test_regex.c` covers the engine — every syntax construct, capture offsets,
-malformed patterns, and a pathological `(a+)+b` that must stay fast.
-`test_syntax.c` covers the registry and lexer, and finishes on the shipped
-pack: it parses all 143 definitions, reports how many rules the engine turns
-down, and checks that C really does colour a hex literal, an operator and an
-all-caps name. `test_buffer.c` covers the gap buffer the console ports edit
-with — insertion and deletion at every position, undo grouping, the line index
-across edits, search with wrapping and whole-word matching, and filling the
-buffer to capacity to check that it refuses further text without corrupting
-what is already there:
+It parses all 143 definitions, reports how many rules the engine turns down,
+and checks that C really does colour a hex literal, an operator and an all-caps
+name.
 
-```
-cl /nologo /W4 /TC tests\test_buffer.c src\core\note_buffer.c
-test_buffer.exe
-```
+`test_pack` covers finding one definition inside a pack without parsing the
+rest, including what happens to a blob with the wrong magic or a truncated
+header. `test_reduce` covers fitting a theme onto a fixed hardware palette —
+the C64's sixteen colours and the Game Boy's four greys — and fuzzes random
+themes against random palettes to check the documented merge order holds.
+`test_gbbasic` covers the Game Boy BASIC: tokenising, detokenising back to the
+same text, and the integer evaluator.
 
 ## Session
 
@@ -372,3 +492,11 @@ everything from the last one out to the scroll bar — are filled in after the
 control has painted.  Neither the wash nor anything else here is named by a
 theme: both are mixed from colours every theme does name, so all 338 of the
 shipped palettes have them.
+
+## Licence
+
+MIT, in `LICENSE`.
+
+The shipped syntax and theme packs are converted from two MIT-licensed
+collections, and the DOS build's font is under the SIL Open Font License;
+`assets/NOTICE.md` names all three and says what was changed.
