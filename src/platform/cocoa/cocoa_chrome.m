@@ -65,6 +65,27 @@ const note_theme *chrome_theme(note_host *h)
     return line;
 }
 
+/* Why the ruler draws itself rather than letting NSRulerView do the framing.
+ *
+ * A ruler view turns default clipping off -- it is built to let hash marks
+ * spill past its own edge -- and the rect it is handed to draw is the scroll
+ * view's, not its own.  NSRulerView's -drawRect: takes that at its word and
+ * runs its divider line the full height of it, so the line carried on up out
+ * of the gutter and across the tab strip above the editor.  Clipping to our
+ * own bounds and drawing only what the gutter is made of keeps it where it
+ * belongs; the divider is not missed, because the gutter has a background
+ * colour of its own and the Win32 gutter draws no line either.
+ */
+- (BOOL)wantsDefaultClipping { return YES; }
+
+- (void)drawRect:(NSRect)rect
+{
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip([self bounds]);
+    [self drawHashMarksAndLabelsInRect:NSIntersectionRect(rect, [self bounds])];
+    [NSGraphicsContext restoreGraphicsState];
+}
+
 - (void)drawHashMarksAndLabelsInRect:(NSRect)rect
 {
     NSTextView *tv = (NSTextView *)[self clientView];
@@ -80,11 +101,9 @@ const note_theme *chrome_theme(note_host *h)
 
     if (!th) return;
 
-    /* The rect that arrives here is the scroll view's, not the ruler's: a
-     * vertical ruler is asked to draw with the whole content rectangle, and
-     * filling it would paint over every glyph in the document -- which looks
-     * exactly like a text view that has stopped drawing.  The ruler's own
-     * bounds are the gutter. */
+    /* Still bounds rather than the rect handed in: -drawRect: above has
+     * already narrowed it, and the whole gutter is repainted in one go
+     * anyway, so there is nothing to gain by filling a slice of it. */
     (void)rect;
     [chrome_color(th->gutter_bg) set];
     NSRectFill([self bounds]);
