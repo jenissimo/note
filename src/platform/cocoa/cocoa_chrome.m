@@ -15,7 +15,10 @@
 
 #import "note_cocoa.h"
 
-#define TABS_H    28.0
+/* The traffic lights own the first stretch of the title bar and are not ours
+ * to move; the strip starts after them.  In full screen they are gone and it
+ * starts at the edge. */
+#define LIGHTS_W  78.0
 #define STATUS_H  22.0
 #define TAB_MAX  200.0
 #define TAB_MIN   70.0
@@ -141,14 +144,39 @@ const note_theme *chrome_theme(note_host *h)
  * The tab strip
  * ========================================================================== */
 
+/* The strip lives in the title bar, so what it has to lay tabs in is the
+ * window's width less whatever the traffic lights are using. */
+static CGFloat tabs_inset(void)
+{
+    return g.fullscreen ? 0.0 : LIGHTS_W;
+}
+
 static CGFloat tab_width(note_host *h, NSRect bounds)
 {
-    CGFloat w;
+    CGFloat w, room = NSWidth(bounds) - tabs_inset();
     if (h->app.ndocs <= 0) return TAB_MAX;
-    w = NSWidth(bounds) / (CGFloat)h->app.ndocs;
+    if (room < TAB_MIN) room = TAB_MIN;
+    w = room / (CGFloat)h->app.ndocs;
     if (w > TAB_MAX) w = TAB_MAX;
     if (w < TAB_MIN) w = TAB_MIN;
     return w;
+}
+
+/* Tabs are squeezed until TAB_MIN and no further -- a name shortened to
+ * nothing is not a tab -- so past a certain count the strip is wider than the
+ * room it has and has to scroll.  How far is not remembered anywhere: it is
+ * whatever puts the active tab on the screen, which is the only position a
+ * user ever wants it in and the only one that cannot go stale. */
+static CGFloat tabs_offset(note_host *h, NSRect bounds, CGFloat w)
+{
+    CGFloat room = NSWidth(bounds) - tabs_inset();
+    CGFloat total = (CGFloat)h->app.ndocs * w, off;
+
+    if (total <= room) return 0.0;
+    off = (CGFloat)(h->app.active + 1) * w - room;
+    if (off < 0.0) off = 0.0;
+    if (off > total - room) off = total - room;
+    return off;
 }
 
 @implementation NoteTabs
@@ -159,6 +187,8 @@ static CGFloat tab_width(note_host *h, NSRect bounds)
 {
     const note_theme *th = chrome_theme(&g);
     CGFloat w = tab_width(&g, [self bounds]);
+    CGFloat inset = tabs_inset();
+    CGFloat off = tabs_offset(&g, [self bounds], w);
     int i;
     NSFont *font = [NSFont systemFontOfSize:12.0];
 
@@ -168,8 +198,16 @@ static CGFloat tab_width(note_host *h, NSRect bounds)
     [chrome_color(th->ui_bg) set];
     NSRectFill([self bounds]);
 
+    /* Clipped to the room after the traffic lights: a scrolled strip has a
+     * tab half off its left edge, and half a tab under the close button
+     * would be worse than none. */
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip(NSMakeRect(inset, 0, NSWidth([self bounds]) - inset,
+                          NSHeight([self bounds])));
+
     for (i = 0; i < g.app.ndocs; i++) {
-        NSRect r = NSMakeRect((CGFloat)i * w, 0, w - 1.0, NSHeight([self bounds]));
+        NSRect r = NSMakeRect(inset - off + (CGFloat)i * w, 0, w - 1.0,
+                              NSHeight([self bounds]));
         int active = (i == g.app.active);
         NSString *title = (NSString *)g.d[i].title ?: @"Untitled";
         NSDictionary *attrs = @{
@@ -206,18 +244,28 @@ static CGFloat tab_width(note_host *h, NSRect bounds)
             [x stroke];
         }
     }
+    [NSGraphicsContext restoreGraphicsState];
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
     NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
     CGFloat w = tab_width(&g, [self bounds]);
-    int hit = (int)(p.x / w);
+    CGFloat inset = tabs_inset();
+    CGFloat x = p.x - inset + tabs_offset(&g, [self bounds], w);
+    int hit = (p.x < inset) ? -1 : (int)(x / w);
 
-    if (hit < 0 || hit >= g.app.ndocs) return;
+    /* Anywhere that is not a tab is still title bar, and a title bar is what
+     * a window is dragged and zoomed by.  Handing the event to the window
+     * says exactly that, and gets the double-click behaviour the user has
+     * chosen in System Settings along with it. */
+    if (hit < 0 || hit >= g.app.ndocs) {
+        [[self window] performWindowDragWithEvent:event];
+        return;
+    }
 
     note_select_doc(&g.app, hit);
-    if (p.x > (CGFloat)(hit + 1) * w - CLOSE_W - 8.0)
+    if (x > (CGFloat)(hit + 1) * w - CLOSE_W - 8.0)
         note_command(&g.app, CMD_FILE_CLOSE);
     menu_sync(&g);
     [self setNeedsDisplay:YES];
@@ -254,16 +302,29 @@ static CGFloat tab_width(note_host *h, NSRect bounds)
 
 void chrome_layout(note_host *h)
 {
+    NSWindow *win = (NSWindow *)h->window;
     NSView *content = (NSView *)h->content;
-    NSRect b = [content bounds];
+    /* The strip is in the title bar now, so what is left for the editor is
+     * the window's content layout rect -- the part AppKit has not given to
+     * the title bar and its accessories.  Asking for it is also the only way
+     * to stay right when the title bar hides itself in full screen. */
+    NSRect b = [win contentLayoutRect];
     CGFloat status_h = h->status_visible ? STATUS_H : 0.0;
-    CGFloat tabs_h = TABS_H;
 
-    [(NSView *)h->tabs setFrame:NSMakeRect(0, NSMaxY(b) - tabs_h, NSWidth(b), tabs_h)];
-    [(NSView *)h->status setFrame:NSMakeRect(0, 0, NSWidth(b), status_h)];
+    if (h->fullscreen) {
+        /* No title bar: the strip is the top of the content, and the editor
+         * starts under it. */
+        [(NSView *)h->tabs setFrame:NSMakeRect(0, NSMaxY(b) - TABS_H,
+                                               NSWidth(b), TABS_H)];
+        b.size.height -= TABS_H;
+    } else {
+        [(NSView *)h->tabs setFrame:
+            NSMakeRect(0, 0, NSWidth([content bounds]), TABS_H)];
+    }
+    [(NSView *)h->status setFrame:NSMakeRect(0, NSMinY(b), NSWidth(b), status_h)];
     [(NSView *)h->status setHidden:!h->status_visible];
-    [(NSView *)h->stack setFrame:NSMakeRect(0, status_h, NSWidth(b),
-                                            NSHeight(b) - tabs_h - status_h)];
+    [(NSView *)h->stack setFrame:NSMakeRect(0, NSMinY(b) + status_h, NSWidth(b),
+                                            NSHeight(b) - status_h)];
     {
         int i;
         for (i = 0; i < NOTE_MAX_DOCS; i++)

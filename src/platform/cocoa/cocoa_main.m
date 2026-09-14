@@ -28,6 +28,9 @@
 #define NKEY_PLUS  0xBB
 #define NKEY_MINUS 0xBD
 
+static void tabs_to_content(note_host *h);
+static void tabs_to_titlebar(note_host *h);
+
 static NSMenu *g_ctxmenu;
 static NSPanel *g_helppanel;
 static NSTimeInterval g_last_shift;
@@ -199,6 +202,28 @@ static const note_accel *accel_for(int id)
     (void)note;
     chrome_layout(&g);
     h_rehighlight(&g);
+}
+
+/* Full screen moves two things at once: the title bar stops reserving its
+ * height from the content, and the traffic lights stop reserving their width
+ * from the strip.  Both are read at layout and paint time, so both need to be
+ * asked again once the window has settled. */
+- (void)windowDidEnterFullScreen:(NSNotification *)note
+{
+    (void)note;
+    g.fullscreen = 1;
+    tabs_to_content(&g);
+    chrome_layout(&g);
+    chrome_repaint(&g);
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)note
+{
+    (void)note;
+    g.fullscreen = 0;
+    tabs_to_titlebar(&g);
+    chrome_layout(&g);
+    chrome_repaint(&g);
 }
 
 - (BOOL)application:(NSApplication *)app openFile:(NSString *)filename
@@ -506,26 +531,91 @@ static NSEvent *note_flags(NSEvent *e)
  * Startup
  * ========================================================================== */
 
+/* The tab strip sits in the title bar rather than under it.
+ *
+ * A window's worth of chrome is a real cost in an editor: the strip was 28
+ * points of window that could have been text, and the title bar above it was
+ * saying the name of the very file whose tab was already highlighted.  The
+ * platform has one way to put a view up there -- a title bar accessory --
+ * and it is the way that keeps the traffic lights, the drag, the double
+ * click and full screen working, because the window is still doing all of
+ * them itself.
+ *
+ * Not the other way: NSWindow's own tabs (tabbingMode) are a tab per window,
+ * and note's documents live in the core, one window, several documents.
+ * Native tabs would mean several cores.
+ *
+ * fullScreenMinHeight is what keeps the strip on the screen in full screen,
+ * where the title bar itself slides away; without it the tabs would go with
+ * it and there would be no way to change document.
+ */
+static void build_titlebar_tabs(note_host *h)
+{
+    NSWindow *window = (NSWindow *)h->window;
+    NSTitlebarAccessoryViewController *bar =
+        [[NSTitlebarAccessoryViewController alloc] init];
+
+    h->tabs = [[NoteTabs alloc] initWithFrame:
+        NSMakeRect(0, 0, NSWidth([[window contentView] bounds]), TABS_H)];
+    [(NSView *)h->tabs setAutoresizingMask:NSViewWidthSizable];
+
+    [bar setView:(NSView *)h->tabs];
+    [bar setLayoutAttribute:NSLayoutAttributeRight];
+    [window addTitlebarAccessoryViewController:bar];
+    h->tabsbar = bar;
+}
+
+/* Full screen has no title bar to put anything in.  It hides itself, and it
+ * takes its accessories with it -- fullScreenMinHeight keeps a bottom
+ * accessory on the screen, but not one laid out inside the bar, which is the
+ * only kind that is compact.  So for the length of full screen the strip
+ * stops being title bar and becomes the top of the content, which is where
+ * the window's top now is.  The same view either way: nothing about it is
+ * built for one place or the other. */
+static void tabs_to_content(note_host *h)
+{
+    NSWindow *window = (NSWindow *)h->window;
+    if ([window titlebarAccessoryViewControllers].count)
+        [window removeTitlebarAccessoryViewControllerAtIndex:0];
+    [(NSView *)h->content addSubview:(NSView *)h->tabs];
+}
+
+static void tabs_to_titlebar(note_host *h)
+{
+    NSWindow *window = (NSWindow *)h->window;
+    [(NSView *)h->tabs removeFromSuperview];
+    if (![window titlebarAccessoryViewControllers].count) {
+        [(NSTitlebarAccessoryViewController *)h->tabsbar setView:(NSView *)h->tabs];
+        [window addTitlebarAccessoryViewController:
+            (NSTitlebarAccessoryViewController *)h->tabsbar];
+    }
+}
+
 static void build_window(note_host *h)
 {
     NSRect frame = NSMakeRect(0, 0, 900, 620);
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable |
+                  NSWindowStyleMaskFullSizeContentView
           backing:NSBackingStoreBuffered defer:NO];
     NSView *content = [window contentView];
 
     [window setTitle:@"note"];
     [window setDelegate:(id<NSWindowDelegate>)h->delegate];
     [window setFrameAutosaveName:@"noteWindow"];
+    /* The title text is hidden rather than empty: the name of the file is
+     * already on its tab, and a second copy of it would be sitting on top of
+     * the strip.  The window still has a title -- the Window menu, Mission
+     * Control and the Dock all ask for it. */
+    [window setTitlebarAppearsTransparent:YES];
+    [window setTitleVisibility:NSWindowTitleHidden];
     [window center];
 
     h->window  = window;
     h->content = content;
 
-    h->tabs = [[NoteTabs alloc] initWithFrame:NSZeroRect];
-    [(NSView *)h->tabs setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
-    [content addSubview:(NSView *)h->tabs];
+    build_titlebar_tabs(h);
 
     h->stack = [[NSView alloc] initWithFrame:NSZeroRect];
     [(NSView *)h->stack setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];

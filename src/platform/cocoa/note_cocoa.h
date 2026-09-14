@@ -60,6 +60,11 @@
 
 #define COCOA_FACE_MAX 64
 
+/* The height of the tab strip.  It is in the header because the strip is a
+ * title bar accessory now: chrome draws it, and the window has to say how
+ * tall the accessory is when it builds it. */
+#define TABS_H 28.0
+
 typedef struct {
     void *edit;      /* NoteTextView *  -- the native control, one per doc */
     void *scroll;    /* NSScrollView *                                     */
@@ -74,6 +79,9 @@ struct note_host {
     void *window;      /* NSWindow *        */
     void *content;     /* NSView *          */
     void *tabs;        /* NoteTabs *        */
+    void *tabsbar;     /* NSTitlebarAccessoryViewController * -- where tabs live
+                        * while there is a title bar to live in              */
+    int   fullscreen;  /* no title bar: the strip moves into the content     */
     void *status;      /* NoteStatus *      */
     void *stack;       /* NSView *  -- the scroll views live here          */
     void *delegate;    /* NoteDelegate *    */

@@ -392,15 +392,21 @@ static int pal_rows_shown(void)
 
 static NSRect pal_frame(note_host *h)
 {
-    NSRect b = [(NSView *)h->content bounds];
+    /* The content view runs the full height of the window now -- the title
+     * bar with the tab strip in it is drawn over the top of it -- so the
+     * palette hangs from the top of the content *layout* rect instead, and
+     * from under the strip when full screen has put the strip in the
+     * content.  Measured from the content bounds it would have come out
+     * behind the tabs. */
+    NSRect b = [(NSWindow *)h->window contentLayoutRect];
+    CGFloat top = NSMaxY(b) - (h->fullscreen ? TABS_H : 0.0);
     CGFloat w = NSWidth(b) - 40.0;
     CGFloat rows = (CGFloat)pal_rows_shown();
     CGFloat hh = h->pal_msg[0] ? 22.0 : 0.0;
     CGFloat height = PAL_INPUT_H + rows * PAL_ROW_H + hh + PAL_PAD;
 
     if (w > PAL_W) w = PAL_W;
-    return NSMakeRect((NSWidth(b) - w) / 2.0,
-                      NSMaxY(b) - PAL_TOP - height, w, height);
+    return NSMakeRect((NSWidth(b) - w) / 2.0, top - PAL_TOP - height, w, height);
 }
 
 @implementation NotePalette

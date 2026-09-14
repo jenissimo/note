@@ -78,9 +78,19 @@ and save are `NSOpenPanel` and `NSSavePanel`. The tab strip, the gutter and
 the command palette are note's own drawing, because AppKit has nothing shaped
 like any of them.
 
+The tab strip lives in the title bar, as an `NSTitlebarAccessoryViewController`
+over a window with `NSWindowStyleMaskFullSizeContentView` -- a window's worth
+of chrome back for the text, with the traffic lights, the drag and the
+double-click still the window's own.  Not `NSWindow`'s native tabs: those are
+a tab per window, and note's documents live in the core, one window and
+several documents.  Full screen has no title bar to sit in, so for as long as
+it lasts the strip becomes the top of the content instead.
+
 Shortcuts are `Command` where the core says `Ctrl`, which is what the same
 gesture is called here; walking the tabs is `Control+Tab`, because
-`Command+Tab` belongs to the window switcher. The key sheet and the palette
+`Command+Tab` belongs to the window switcher.  Cut, Copy and Paste are the
+responder chain's rather than the core's, so they edit whatever is focused --
+the document, or the field in the Find panel. The key sheet and the palette
 spell them with the platform's symbols.
 
 The packs ride in `Contents/Resources`, which is what the backend reports as
