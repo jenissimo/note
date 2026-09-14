@@ -43,7 +43,15 @@ typedef struct {
 static note_palette g_pal;
 static int          g_mode;
 static int          g_sel;
+/* Bumped every time the palette is opened in any mode.  Six of the commands
+ * the palette runs -- Choose Theme, Font, Go to Line, Rename, Open Path, Run
+ * -- are themselves palette modes, so committing one opens the palette again
+ * from inside the commit.  Without this counter the caller then closed what
+ * its own command had just put on screen, and the list never appeared. */
+static unsigned     g_open_gen;
 static NSMutableArray *g_history;   /* what Run has been asked for before */
+
+static int pal_commit(note_host *h);
 
 static const note_pal_row *pal_current(void)
 {
@@ -532,9 +540,7 @@ static NSRect pal_frame(note_host *h)
     if (p.y < PAL_INPUT_H || row < 0 || row >= pal_rows_shown()) return;
     g_sel = row;
     if (kModes[g_mode].preview) kModes[g_mode].preview(&g, pal_current());
-    if (kModes[g_mode].commit && kModes[g_mode].commit(&g, pal_current()))
-        pal_close(&g);
-    else
+    if (!pal_commit(&g))
         [self setNeedsDisplay:YES];
 }
 @end
@@ -542,6 +548,17 @@ static NSRect pal_frame(note_host *h)
 /* ==========================================================================
  * Opening, closing, keys
  * ========================================================================== */
+
+/* Runs the current mode's commit and closes the palette only if that commit
+ * did not open a palette of its own. */
+static int pal_commit(note_host *h)
+{
+    unsigned gen = g_open_gen;
+    if (!kModes[g_mode].commit) return 0;
+    if (!kModes[g_mode].commit(h, pal_current())) return 0;
+    if (g_open_gen == gen) pal_close(h);
+    return 1;
+}
 
 static void pal_relayout(note_host *h)
 {
@@ -572,6 +589,7 @@ static void pal_open_mode(note_host *h, int mode)
     }
     [(NSView *)h->overlay setHidden:NO];
     h->pal_open = 1;
+    g_open_gen++;
     pal_relayout(h);
     if (m->preview) m->preview(h, pal_current());
 }
@@ -632,8 +650,7 @@ int pal_key(note_host *h, NSEvent *e)
         return 1;
     case '\r':
     case 3:    /* Enter */
-        if (m->commit && m->commit(h, pal_current())) pal_close(h);
-        else pal_relayout(h);
+        if (!pal_commit(h)) pal_relayout(h);
         return 1;
     case NSUpArrowFunctionKey:   pal_move(h, -1); return 1;
     case NSDownArrowFunctionKey: pal_move(h, +1); return 1;
