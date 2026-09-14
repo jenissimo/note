@@ -98,6 +98,19 @@ its portable folder, so the 143 languages and 338 palettes load through the
 same path a `.syntax` file of your own would. Definitions and the session
 live in `~/Library/Application Support/note`.
 
+The icon rides there too, and it is the Windows one in a different shape: the
+same generator draws it, cut to the rounded square of the macOS icon grid so
+it does not stand taller than its neighbours in the Dock.
+
+```
+python3 tools/make_icon.py --icns build/cocoa/note.icns
+```
+
+`build.sh` runs that itself and redraws only when the generator changed --
+ten sizes up to 1024 take the better part of a minute in plain Python. The
+PNGs go to a `.iconset` folder and `iconutil` folds them into the `.icns`;
+`--iconset DIR` stops after the PNGs, which is the way to look at them.
+
 ```
 src/platform/cocoa/
   note_cocoa.h       the state and types the backend shares across its parts

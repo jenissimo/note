@@ -11,7 +11,8 @@
 #
 # The packs ride in Contents/Resources: the Cocoa backend's exe_dir is that
 # folder, so the 143 languages and 338 palettes arrive through exactly the
-# path a user's own .syntax file would.
+# path a user's own .syntax file would.  The icon rides there too, drawn by
+# tools/make_icon.py the same way the Windows .ico is -- no binary to commit.
 
 set -e
 
@@ -52,6 +53,16 @@ clang -o "$app/Contents/MacOS/note" "$out/obj"/*.o \
 cp "$root/assets/syntax.pack" "$app/Contents/Resources/syntax.pack"
 cp "$root/assets/themes.pack" "$app/Contents/Resources/themes.pack"
 
+# The icon is drawn by the same generator that draws the Windows one, in the
+# macOS shape, and folded into an .icns by iconutil.  Drawing ten sizes up to
+# 1024 takes the better part of a minute in plain Python, so the result is
+# kept in build/ and redrawn only when the generator that made it changed.
+icns="$out/note.icns"
+if [ ! -f "$icns" ] || [ "$root/tools/make_icon.py" -nt "$icns" ]; then
+    python3 "$root/tools/make_icon.py" --icns "$icns"
+fi
+cp "$icns" "$app/Contents/Resources/note.icns"
+
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -62,6 +73,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>note</string>
   <key>CFBundleIdentifier</key><string>com.note.editor</string>
   <key>CFBundleExecutable</key><string>note</string>
+  <key>CFBundleIconFile</key><string>note.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

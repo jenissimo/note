@@ -12,10 +12,20 @@ taskbar and a light Explorer window, which a dark icon would not; the band
 carries the colour so the shape still reads at 16 pixels, where anything finer
 turns to mush.
 
+On macOS the same drawing is wanted in a different shape: the system draws
+application icons as a rounded square sitting in a margin, so the page grows
+into that square rather than keeping its portrait proportions.  It is the same
+icon -- light page, coloured band, three lines -- cut to the shape the Dock
+expects, and it leaves through .icns instead of .ico.
+
 Usage:  python tools/make_icon.py [assets/note.ico]
+        python tools/make_icon.py --icns [assets/note.icns]     (macOS only)
+        python tools/make_icon.py --iconset DIR
 """
 
+import os
 import struct
+import subprocess
 import sys
 import zlib
 
@@ -25,13 +35,32 @@ BORDER = (172, 169, 163)
 ACCENT = (74, 144, 217)
 LINE   = (126, 132, 141)
 
-SS = 8            # supersampling factor; coverage is counted, not filtered
+# Supersampling factor; coverage is counted, not filtered.  Small icons want
+# all of it, because that is where a rounded corner lives or dies, but 8x8
+# samples of a 1024 canvas is 67 million of them and pure Python takes minutes
+# over that.  Sampling to a fixed resolution instead keeps every size honest
+# and every size quick: the big ones have pixels to spare for their own edges.
+SS_MAX = 8
+SS_GRID = 2048
 
-# Geometry in fractions of the canvas.
-PAGE_X0, PAGE_Y0, PAGE_X1, PAGE_Y1 = 0.13, 0.07, 0.87, 0.93
-PAGE_R   = 0.11
+
+def ss_for(size):
+    return max(2, min(SS_MAX, -(-SS_GRID // size)))
+
+
+# Geometry in fractions of the canvas.  Windows draws the page edge to edge;
+# macOS wants it as the rounded square of its own icon grid, which is 824 of
+# 1024 across with a corner radius of 185 -- hence the 0.098/0.902/0.181.
+# Drawn any larger it sits taller than its neighbours in the Dock.
+SHAPE = {
+    "win": (0.13, 0.07, 0.87, 0.93, 0.11),
+    "mac": (0.0977, 0.0977, 0.9023, 0.9023, 0.181),
+}
 BAND_H   = 0.22   # of the page height
 LINE_PAD = 0.14   # inset from the page edge, of the page width
+
+ICONSET = [(16, 1), (16, 2), (32, 1), (32, 2), (128, 1), (128, 2),
+           (256, 1), (256, 2), (512, 1), (512, 2)]
 
 
 def rounded_inside(px, py, x0, y0, x1, y1, r):
@@ -60,9 +89,11 @@ def over(dst, src, a):
     return (nr, ng, nb, na)
 
 
-def render(size):
+def render(size, shape="win"):
     """An RGBA pixel list, row-major from the top."""
     px = [(0, 0, 0, 0.0)] * (size * size)
+    PAGE_X0, PAGE_Y0, PAGE_X1, PAGE_Y1, PAGE_R = SHAPE[shape]
+    SS = ss_for(size)
 
     band_y1 = PAGE_Y0 + (PAGE_Y1 - PAGE_Y0) * BAND_H
     pw = PAGE_X1 - PAGE_X0
@@ -163,7 +194,49 @@ def as_png(px, size):
             + chunk(b"IEND", b""))
 
 
+def write_iconset(directory):
+    """The ten PNGs macOS names by point size and scale, ready for iconutil."""
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    drawn = {}      # 32, 256 and 512 pixels are each asked for twice
+    for points, scale in ICONSET:
+        size = points * scale
+        if size not in drawn:
+            drawn[size] = as_png(render(size, "mac"), size)
+        name = "icon_%dx%d%s.png" % (points, points,
+                                     "@2x" if scale == 2 else "")
+        with open(os.path.join(directory, name), "wb") as f:
+            f.write(drawn[size])
+        print("  %s (%d px)" % (name, size))
+    return directory
+
+
+def make_icns(out):
+    """Draw the iconset next to the target and let iconutil fold it up.
+
+    iconutil ships with macOS and is the only supported way to write an .icns;
+    there is no point reimplementing its container when every Mac has it.
+    """
+    stem = out[:-5] if out.endswith(".icns") else out
+    directory = stem + ".iconset"
+    parent = os.path.dirname(out)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    write_iconset(directory)
+    subprocess.check_call(["iconutil", "-c", "icns", "-o", out, directory])
+    print("wrote %s: %d images, %d bytes"
+          % (out, len(ICONSET), os.path.getsize(out)))
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--iconset":
+        write_iconset(sys.argv[2] if len(sys.argv) > 2
+                      else "build/note.iconset")
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--icns":
+        make_icns(sys.argv[2] if len(sys.argv) > 2 else "assets/note.icns")
+        return
+
     out = sys.argv[1] if len(sys.argv) > 1 else "assets/note.ico"
 
     # Only 16 stays a bitmap, as the one entry nothing anywhere can misread.
