@@ -649,17 +649,16 @@ static void cell(int x, int y, char ch, unsigned char fg, unsigned char bg)
  * can be replaced at runtime and the adapter never knows the difference.  Each
  * font here is 256 glyphs of 16 scanlines, one byte per row, high bit
  * leftmost, in code page 437 order -- exactly what the VGA holds and what
- * INT 10h/AX=1110h takes.  See assets/NOTICE.md for where they came from and,
- * for the IBM one, why it is here on sufferance. */
+ * INT 10h/AX=1110h takes.  See assets/NOTICE.md for where Terminus came from.
+ * The adapter's own set is not carried here: the BIOS can restore it. */
 #include "font_terminus.h"
-#include "font_vga.h"
 
-enum { FONT_ROM = 0, FONT_TERMINUS, FONT_VGA, FONT_COUNT };
+enum { FONT_ROM = 0, FONT_TERMINUS, FONT_COUNT };
 
 static int g_font = FONT_TERMINUS;
 
 static const char *kFontNames[FONT_COUNT] = {
-    "Adapter ROM", "Terminus", "IBM VGA"
+    "Adapter ROM", "Terminus"
 };
 
 /* INT 10h/AX=1110h wants the glyphs in real-mode addressable memory, and a
@@ -688,7 +687,6 @@ static void font_apply(void)
 
     switch (g_font) {
     case FONT_TERMINUS: font_upload(kFontTerminus[0], 0, 256); break;
-    case FONT_VGA:      font_upload(kFontVGA[0],      0, 256); break;
     default:
         /* Reloading the ROM set is a BIOS service, so the original is always
          * one call away and note never has to carry a copy of it. */

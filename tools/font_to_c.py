@@ -2,10 +2,8 @@
 
     python tools/font_to_c.py ter-u16n.bdf  src/platform/console/font_terminus.h \
         --name kFontTerminus --note "Terminus 4.49.1, SIL OFL 1.1"
-    python tools/font_to_c.py VGA8.F16 src/platform/console/font_vga.h \
-        --name kFontVGA
 
-Two input formats, because the two fonts worth having arrive differently:
+Two input formats, because bitmap fonts arrive in both:
 
   .bdf   text, one glyph per STARTCHAR block, indexed by Unicode codepoint
   .f16   raw, exactly 256 glyphs of 16 bytes, already in the VGA's own order
