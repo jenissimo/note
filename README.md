@@ -57,6 +57,71 @@ python tools/make_icon.py assets/note.ico
 resources rather than something loaded at startup, because Explorer draws a
 file's icon by reading it out of the executable without ever running it.
 
+## macOS
+
+```
+./build.sh                   build/cocoa/note.app    ~200 KB
+./build.sh debug
+./build.sh run               build it and start it
+```
+
+Needs clang, which arrives with the command line tools -- no Xcode project,
+no package manager, nothing to install. A `.app` is a folder with a plist in
+it, so the whole build is a dozen `clang -c` lines and the copying.
+
+The backend is `src/platform/cocoa/`, and it is the same bargain the Win32 one
+makes: the core decides what the editor does, the platform decides what it
+feels like. The text control is a real `NSTextView` -- its own undo, its own
+IME, its own accessibility, the emoji picker, the services menu -- the menu
+bar is a real `NSMenu` in the system bar with real key equivalents, and open
+and save are `NSOpenPanel` and `NSSavePanel`. The tab strip, the gutter and
+the command palette are note's own drawing, because AppKit has nothing shaped
+like any of them.
+
+The tab strip lives in the title bar, as an `NSTitlebarAccessoryViewController`
+over a window with `NSWindowStyleMaskFullSizeContentView` -- a window's worth
+of chrome back for the text, with the traffic lights, the drag and the
+double-click still the window's own.  Not `NSWindow`'s native tabs: those are
+a tab per window, and note's documents live in the core, one window and
+several documents.  Full screen has no title bar to sit in, so for as long as
+it lasts the strip becomes the top of the content instead.
+
+Shortcuts are `Command` where the core says `Ctrl`, which is what the same
+gesture is called here; walking the tabs is `Control+Tab`, because
+`Command+Tab` belongs to the window switcher.  Cut, Copy and Paste are the
+responder chain's rather than the core's, so they edit whatever is focused --
+the document, or the field in the Find panel. The key sheet and the palette
+spell them with the platform's symbols.
+
+The packs ride in `Contents/Resources`, which is what the backend reports as
+its portable folder, so the 143 languages and 338 palettes load through the
+same path a `.syntax` file of your own would. Definitions and the session
+live in `~/Library/Application Support/note`.
+
+The icon rides there too, and it is the Windows one in a different shape: the
+same generator draws it, cut to the rounded square of the macOS icon grid so
+it does not stand taller than its neighbours in the Dock.
+
+```
+python3 tools/make_icon.py --icns build/cocoa/note.icns
+```
+
+`build.sh` runs that itself and redraws only when the generator changed --
+ten sizes up to 1024 take the better part of a minute in plain Python. The
+PNGs go to a `.iconset` folder and `iconutil` folds them into the `.icns`;
+`--iconset DIR` stops after the PNGs, which is the way to look at them.
+
+```
+src/platform/cocoa/
+  note_cocoa.h       the state and types the backend shares across its parts
+  cocoa_main.m       the window, the menu bar, the key routing, startup
+  cocoa_host.m       files, folders, the clock -- the plain services
+  cocoa_edit.m       NSTextView, the highlighter, find, and UTF-8 vs UTF-16
+  cocoa_chrome.m     tabs, the status bar, the gutter, applying a theme
+  cocoa_dialogs.m    the system dialogs: open, save, font, find, print
+  cocoa_palette.m    the command palette overlay and its list modes
+```
+
 ## How it is put together
 
 The point of the layout is that the interesting half of an editor is not
@@ -85,6 +150,14 @@ src/platform/win32/
   win32_chrome.c     tabs, the status bar, applying a theme
   win32_dialogs.c    the system dialogs: open, save, font, print
   win32_host.c       files, folders, the clock — the plain services
+src/platform/cocoa/
+  note_cocoa.h       the state and types the backend shares across its parts
+  cocoa_main.m       the window, the menu bar, the key routing, startup
+  cocoa_edit.m       NSTextView, the highlighter, the gutter arithmetic
+  cocoa_chrome.m     tabs, the status bar, the gutter, applying a theme
+  cocoa_dialogs.m    the system dialogs: open, save, font, find, print
+  cocoa_palette.m    the command palette overlay and its list modes
+  cocoa_host.m       files, folders, the clock -- the plain services
 src/platform/console/
   console_main.c     one source for MS-DOS, 16-bit MS-DOS and the Commodore 64
   font_terminus.h    a VGA character set the DOS build uploads at startup

@@ -40,6 +40,29 @@
 #endif
 
 /* --------------------------------------------------------------------------
+ * The separator this platform writes a path with.
+ *
+ * The core joins a folder and a leaf in four places -- the session files and
+ * the four definition folders -- and it used to spell that join "\\", which is
+ * what every backend there was wanted.  A Unix backend is the first that does
+ * not: "note\\session.idx" is not a file in a folder there, it is one file
+ * with a backslash in its name, so the session and the packs would both land
+ * beside the folder meant to hold them.
+ *
+ * Keyed on the compiler rather than asked of the backend, for the same reason
+ * NOTE_NCHAR_UTF16 is: the core is compiled once and a backend that answered
+ * this after including the header would change the shape of the session for
+ * itself and not for the code that writes it.
+ * -------------------------------------------------------------------------- */
+#ifndef NOTE_SEP
+  #if defined(__APPLE__) || defined(__unix__) || defined(__linux__)
+    #define NOTE_SEP N("/")
+  #else
+    #define NOTE_SEP N("\\")
+  #endif
+#endif
+
+/* --------------------------------------------------------------------------
  * Commands.  One id per user-visible action; the same ids drive the menu bar,
  * the context menu and the accelerator table, so a backend never invents its
  * own numbering.
