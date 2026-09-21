@@ -164,6 +164,26 @@ DWORD os_current_dir(nchar *dst, int cap)
     return (DWORD)n_len(dst);
 }
 
+/* A relative name made absolute against the current directory.  Two callers
+ * need it and both need it early: a path handed to another instance is read
+ * in that instance's directory rather than this one's, and a path kept in a
+ * tab outlives whatever directory note was started in.  Falls back to copying
+ * the name through, which is what the editor did with it before. */
+void os_full_path(const nchar *path, nchar *dst, int cap)
+{
+    char a[ACP_MAX], full[ACP_MAX];
+    DWORD n = 0;
+
+    if (win_wide) {
+        n = GetFullPathNameW((LPCWSTR)path, (DWORD)cap, (LPWSTR)dst, NULL);
+        if (n && n < (DWORD)cap) return;
+    } else if (acp_path(path, a, (int)sizeof a)) {
+        n = GetFullPathNameA(a, (DWORD)sizeof full, full, NULL);
+        if (n && n < sizeof full) { wide_of(full, dst, cap); return; }
+    }
+    n_copy(dst, path, cap);
+}
+
 HANDLE os_create_file(const nchar *path, DWORD access, DWORD share, DWORD disp)
 {
     char a[ACP_MAX];
@@ -534,6 +554,30 @@ int os_message_box(HWND owner, const nchar *text, const nchar *title, UINT flags
     if (win_wide) return MessageBoxW(owner, (LPCWSTR)text, (LPCWSTR)title, flags);
     return MessageBoxA(owner, acp_text(text, at, (int)sizeof at),
                        acp_text(title, ai, (int)sizeof ai), flags);
+}
+
+/* A send that cannot wedge this process behind a wedged one.  Only the
+ * hand-off uses it: everything else here talks to windows this thread owns,
+ * where a send is a call.  Returns 0 if the other side never answered, and
+ * the caller then does the work itself. */
+LRESULT os_send_timeout(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UINT ms)
+{
+    DWORD_PTR r = 0;
+    if (win_wide) {
+        if (!SendMessageTimeoutW(wnd, msg, wp, lp,
+                                 SMTO_ABORTIFHUNG, ms, &r)) return 0;
+    } else {
+        if (!SendMessageTimeoutA(wnd, msg, wp, lp,
+                                 SMTO_ABORTIFHUNG, ms, &r)) return 0;
+    }
+    return (LRESULT)r;
+}
+
+HWND os_find_window(const nchar *cls)
+{
+    char a[128];
+    if (win_wide) return FindWindowW((LPCWSTR)cls, NULL);
+    return FindWindowA(acp_text(cls, a, (int)sizeof a), NULL);
 }
 
 UINT os_register_message(const nchar *name)

@@ -862,7 +862,15 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
                         hl_touch(h, doc, (int)at.cpMin);
                         if (doc == h->app.active) {
                             h->cache_valid = 0;
-                            queue_view(h);
+                            /* Now, not in forty milliseconds' time: this is
+                             * the moment the text and the band disagree, and
+                             * a timer between them is exactly long enough to
+                             * be seen -- the line's wash lagging a character
+                             * behind the typing, which is what it looked
+                             * like.  The pass is bounded by what is on
+                             * screen, so doing it per keystroke is a couple
+                             * of milliseconds. */
+                            service_view(h);
                             update_status(h);
                         }
                         break;
@@ -906,6 +914,36 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 #endif  /* the view moves its own caret, and knows when it did */
 
+    /* Another note, handing over what it was asked to open -- see hand_off().
+     * The payload is this build's own nchars and nothing else is answered, so
+     * a message from anywhere else falls through to the default handling. */
+    case WM_COPYDATA: {
+        COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
+        nchar path[NOTE_PATH_MAX];
+        int   n, i;
+
+        if (!cd || cd->dwData != NOTE_HANDOFF) break;
+        /* Not up yet: answering 0 sends that note back to starting its own
+         * window, which is better than opening a file into an editor that is
+         * still being assembled. */
+        if (!h->ready) return 0;
+
+        if (IsIconic(wnd)) ShowWindow(wnd, SW_RESTORE);
+        SetForegroundWindow(wnd);
+
+        n = cd->lpData ? (int)(cd->cbData / sizeof(nchar)) : 0;
+        if (n > NOTE_PATH_MAX - 1) n = NOTE_PATH_MAX - 1;
+        for (i = 0; i < n; i++) path[i] = ((const nchar *)cd->lpData)[i];
+        path[n > 0 ? n : 0] = 0;
+        /* A hand-off with no name is someone starting note again to get to
+         * the one that is already running: the window above is the whole of
+         * the answer. */
+        if (path[0]) note_open(&h->app, path);
+
+        SetFocus(active_edit());
+        return 1;
+    }
+
     case WM_DROPFILES: {
         nchar path[NOTE_PATH_MAX];
         HDROP drop = (HDROP)wp;
@@ -937,29 +975,99 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
  * Startup
  * ------------------------------------------------------------------------- */
 
-static void first_arg(nchar *out, int cap)
+/* The command line, as note reads it: the first argument that is not a
+ * switch, made absolute, and whether a switch asked for a window of its own.
+ *
+ * Absolute because the name outlives the directory it was typed in -- a tab
+ * remembers where it saves, and a name handed to the instance that is already
+ * running would otherwise be read in that instance's directory rather than in
+ * the one the user typed it from. */
+static void read_args(nchar *out, int cap, int *newwin)
 {
-    nchar line[NOTE_PATH_MAX * 2];
+    nchar line[NOTE_PATH_MAX * 2], raw[NOTE_PATH_MAX];
     const nchar *p = line;
-    const nchar quote = (nchar)'"', space = (nchar)' ', tab = (nchar)'\t';
-    int i = 0;
+    const nchar quote = (nchar)'"', space = (nchar)' ', tab = (nchar)'	';
 
     out[0] = 0;
+    *newwin = 0;
     os_command_line(line, NOTE_PATH_MAX * 2);
 
+    /* Step over argv[0], which is the executable and never a file to open. */
     if (*p == quote) { p++; while (*p && *p != quote) p++; if (*p) p++; }
     else             { while (*p && *p != space && *p != tab) p++; }
-    while (*p == space || *p == tab) p++;
-    if (!*p) return;
 
-    if (*p == quote) {
-        p++;
-        while (*p && *p != quote && i < cap - 1) out[i++] = *p++;
-    } else {
-        while (*p && i < cap - 1) out[i++] = *p++;
-        while (i > 0 && (out[i - 1] == space || out[i - 1] == tab)) i--;
+    for (;;) {
+        int i = 0;
+
+        while (*p == space || *p == tab) p++;
+        if (!*p) break;
+
+        if (*p == quote) {
+            p++;
+            while (*p && *p != quote && i < NOTE_PATH_MAX - 1) raw[i++] = *p++;
+            if (*p == quote) p++;
+        } else {
+            while (*p && *p != space && *p != tab && i < NOTE_PATH_MAX - 1)
+                raw[i++] = *p++;
+        }
+        raw[i] = 0;
+        if (!raw[0]) continue;
+
+        /* -n, --new: this one wants its own window rather than a tab in the
+         * note that is already open. */
+        if (raw[0] == (nchar)'-' || raw[0] == (nchar)'/') {
+            if (n_eq(raw, N("-n")) || n_eq(raw, N("--new")) ||
+                n_eq(raw, N("/n")))
+                *newwin = 1;
+            continue;
+        }
+
+        os_full_path(raw, out, cap);
+        break;
     }
-    out[i] = 0;
+}
+
+/* Hands the file over to the note that is already running and reports that it
+ * took it.  One editor, one window: a second note on the same file would be
+ * two buffers over one file, and a second note on nothing is a window the user
+ * asked for by accident -- from a shell, from a file association, from the
+ * same shortcut pressed twice.  `note -n` still starts one.
+ *
+ * The window is found by class name, which is this build's own and is
+ * registered before the window exists, so the answer is a note and not
+ * something else with a matching title. */
+static int hand_off(const nchar *path)
+{
+    typedef BOOL (WINAPI *PFN_ALLOW)(DWORD);
+    COPYDATASTRUCT cd;
+    HWND    other = os_find_window(N("noteWindow"));
+    HMODULE u;
+    PFN_ALLOW allow;
+    DWORD   pid = 0;
+
+    if (!other) return 0;
+
+    /* The foreground right now is whatever launched us, so the permission to
+     * raise a window is ours to give away -- and giving it to the other note
+     * is what lets its SetForegroundWindow actually raise it instead of
+     * flashing the taskbar button.  Missing on Windows 95, where nothing
+     * arbitrates the foreground and none of this is needed. */
+    GetWindowThreadProcessId(other, &pid);
+    u = os_module(N("user32.dll"));
+    allow = u ? (PFN_ALLOW)GetProcAddress(u, "AllowSetForegroundWindow") : 0;
+    if (allow && pid) allow(pid);
+
+    cd.dwData = NOTE_HANDOFF;
+    cd.cbData = (DWORD)((n_len(path) + 1) * (int)sizeof(nchar));
+    cd.lpData = (void *)path;
+    /* Sent rather than posted: the buffer has to outlive the call, and the
+     * answer says whether that note understood it.  With a deadline, because
+     * a note that is busy or wedged must not take this one down with it --
+     * the file then opens in a window of its own, which is the behaviour
+     * this whole function exists to avoid but is still better than a second
+     * editor that never appears. */
+    return os_send_timeout(other, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cd,
+                           4000) ? 1 : 0;
 }
 
 static void enable_dpi(void)
@@ -975,7 +1083,7 @@ static int note_main(void)
     WNDCLASSEXW wc;
     MSG   msg;
     nchar arg[NOTE_PATH_MAX];
-    int   i, restored;
+    int   i, restored, newwin;
 
     /* Before anything else, caps_probe() included: that already goes through
      * the boundary to load a library by name, and nothing may call a Windows
@@ -986,6 +1094,13 @@ static int note_main(void)
     /* Every later decision about the frame and the menus reads the answers
      * this fills in. */
     caps_probe();
+
+    /* What to open, and whether this note is allowed to be a second one.
+     * Before the window, the session and the classes: a hand-off does all of
+     * its work in the note that is already running, and this one exits having
+     * touched nothing -- no session file read, no theme applied. */
+    read_args(arg, NOTE_PATH_MAX, &newwin);
+    if (!newwin && hand_off(arg)) return 0;
 
     enable_dpi();
 
@@ -1121,7 +1236,6 @@ static int note_main(void)
     g.findmsg = os_register_message(N("commdlg_FindReplace"));
 
     restored = note_session_restore(&g.app);
-    first_arg(arg, NOTE_PATH_MAX);
 
     /* The file named on the command line is opened below, once there is a
      * window to open it into.  Only the empty document is settled here: with a
@@ -1159,6 +1273,10 @@ static int note_main(void)
     queue_view(&g);
 
     SetTimer(g.wnd, TIMER_SESSION, 4000, NULL);
+
+    /* From here on a second note can hand its file over rather than open a
+     * window of its own. */
+    g.ready = 1;
 
     while (os_get_message(&msg) > 0) {
         if (g.finddlg && os_is_dialog_message(g.finddlg, &msg)) continue;
