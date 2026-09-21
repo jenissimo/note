@@ -193,6 +193,7 @@ void     os_command_line(nchar *dst, int cap);
 DWORD    os_module_file_name(HMODULE mod, nchar *dst, int cap);
 DWORD    os_env(const nchar *name, nchar *dst, int cap);
 DWORD    os_current_dir(nchar *dst, int cap);
+void     os_full_path(const nchar *path, nchar *dst, int cap);
 HANDLE   os_create_file(const nchar *path, DWORD access, DWORD share,
                         DWORD disp);
 int      os_delete_file(const nchar *path);
@@ -231,6 +232,8 @@ void     os_set_window_text(HWND wnd, const nchar *s);
 int      os_message_box(HWND owner, const nchar *text, const nchar *title,
                         UINT flags);
 UINT     os_register_message(const nchar *name);
+HWND     os_find_window(const nchar *cls);
+LRESULT  os_send_timeout(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UINT ms);
 HICON    os_icon(HINSTANCE inst, int id);
 /* The stock cursors, by the number behind the IDC_ macro: the macro casts to
  * LPCWSTR and half of os_cursor wants LPCSTR. */
@@ -298,6 +301,10 @@ enum { CAPBTN_NONE = 0, CAPBTN_MIN, CAPBTN_MAX, CAPBTN_CLOSE };
 /* Chrome sizes, written for 96 DPI and scaled through px(). */
 #define STATUS_H  22
 #define TABS_H    26
+
+/* WM_COPYDATA's dwData when one note hands a file to another.  Any other
+ * value is somebody else's message and is left to the default handling. */
+#define NOTE_HANDOFF  0x6E6F7465UL   /* 'note' */
 
 #define TIMER_VIEW     1          /* repaint gutter / recolour, debounced */
 #define TIMER_SESSION  2          /* autosave unsaved buffers            */
@@ -431,6 +438,11 @@ struct note_host {
      * into is still coming and has to go the same way. */
     int eat_tab;
     int quitting;
+    /* Set once the editor is up and able to take a file from another note.
+     * Until then a hand-off is refused rather than run against a half-built
+     * application -- startup sends messages of its own, and a message sent
+     * from outside is dispatched inside every one of them. */
+    int ready;
     int view_pending;         /* gutter/highlight refresh queued */
     int dpi;                  /* of the monitor the window is on */
     int tabs_h, status_h, gutter_w;
