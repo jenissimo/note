@@ -700,7 +700,7 @@ void hl_invalidate(note_host *h, int doc);
 void hl_touch(note_host *h, int doc, int off);
 void hl_step(note_host *h);
 void curline_update(note_host *h);
-void curline_tail(note_host *h, HWND e);
+void curline_tail(note_host *h, HWND e, const RECT *clip);
 void help_show(note_host *h);
 void h_set_hint_text(note_host *h, const nchar *text);
 void help_close(note_host *h);
