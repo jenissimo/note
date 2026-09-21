@@ -524,7 +524,6 @@ void hl_touch(note_host *h, int doc, int caret)
 
     if (doc < 0 || doc >= NOTE_MAX_DOCS) return;
     d = &h->d[doc];
-    d->cur_valid = 0;             /* the band's offsets have moved */
 
     if (!d->hl_valid) return;
 
@@ -591,42 +590,160 @@ void hl_invalidate(note_host *h, int doc)
  * slice still starts from the nearest point the core can promise is outside
  * any string or block comment, which is what keeps the cost independent of
  * how far down the file the range happens to be. */
+/* -------------------------------------------------------------------------
+ * Setting a colour on a range
+ *
+ * Every colour the editor puts on text -- the lexer's, and the caret band's
+ * background -- goes through here, and it has two ways of doing it.
+ *
+ * The one it wants is the Text Object Model: ITextRange names the characters
+ * directly, so nothing is done to the selection, nothing is done to the
+ * scroll position, and the control invalidates the characters that changed
+ * and no others.
+ *
+ * The one it falls back to is EM_SETCHARFORMAT, which can only format the
+ * selection.  That means moving the selection and putting it back, and moving
+ * it is visible, so the whole control has to be frozen with WM_SETREDRAW
+ * around the lot -- and thawing it invalidates every pixel.  On each
+ * keystroke that was the whole client area repainted twice, which is what the
+ * caret's line was flickering with.  The fallback stays for a RichEdit whose
+ * OLE interface will not answer; Msftedit's always does.
+ * ------------------------------------------------------------------------- */
+
+/* "Whatever the page is", for either half of the call -- CFE_AUTO* for the
+ * message, tomAutoColor for the model. */
+#define FMT_AUTO ((COLORREF)0xFF000000u)
+
+typedef struct {
+    note_host     *h;
+    HWND           e;
+    ITextDocument *tom;     /* null: the selection path below */
+    CHARRANGE      sel;     /* only saved when there is no model */
+    POINT          scroll;
+    int            was_mod;
+} fmt_ctx;
+
+static void fmt_begin(fmt_ctx *c, note_host *h, HWND e)
+{
+    c->h = h;
+    c->e = e;
+
+    /* Colouring sets the control's modify flag, and its EN_CHANGE can arrive
+     * after we have stopped suppressing.  Remember the real state and put it
+     * back, so opening a file never leaves it looking edited. */
+    c->was_mod = (int)SendMessageW(e, EM_GETMODIFY, 0, 0);
+
+    /* Formatting would otherwise pile records onto the undo stack, and Ctrl+Z
+     * would undo the highlighter instead of the typing. */
+    c->tom = tom_open(e);
+    if (c->tom) c->tom->lpVtbl->Undo(c->tom, tomSuspend, 0);
+
+    h->suppress++;
+
+    if (!c->tom) {
+        SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&c->sel);
+        SendMessageW(e, EM_GETSCROLLPOS, 0, (LPARAM)&c->scroll);
+        SendMessageW(e, WM_SETREDRAW, FALSE, 0);
+    }
+}
+
+/* `back` picks which of the two colours a character has: the glyphs, or the
+ * band behind them. */
+static void fmt_set(fmt_ctx *c, int from, int to, COLORREF col, int back)
+{
+    if (to <= from) return;
+
+    if (c->tom) {
+        ITextRange *r = 0;
+        ITextFont  *f = 0;
+        long        v = (col == FMT_AUTO) ? tomAutoColor : (long)col;
+
+        if (FAILED(c->tom->lpVtbl->Range(c->tom, from, to, &r)) || !r) return;
+        if (SUCCEEDED(r->lpVtbl->GetFont(r, &f)) && f) {
+            if (back) f->lpVtbl->SetBackColor(f, v);
+            else      f->lpVtbl->SetForeColor(f, v);
+            f->lpVtbl->Release(f);
+        }
+        r->lpVtbl->Release(r);
+        return;
+    }
+
+    {
+        CHARFORMAT2W cf;
+        CHARRANGE    r;
+
+        memset(&cf, 0, sizeof(cf));
+        cf.cbSize = sizeof(cf);
+        if (back) {
+            cf.dwMask = CFM_BACKCOLOR;
+            if (col == FMT_AUTO) cf.dwEffects   = CFE_AUTOBACKCOLOR;
+            else                 cf.crBackColor = col;
+        } else {
+            cf.dwMask = CFM_COLOR;
+            if (col == FMT_AUTO) cf.dwEffects   = CFE_AUTOCOLOR;
+            else                 cf.crTextColor = col;
+        }
+
+        r.cpMin = from; r.cpMax = to;
+        SendMessageW(c->e, EM_EXSETSEL, 0, (LPARAM)&r);
+        SendMessageW(c->e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+}
+
+static void fmt_end(fmt_ctx *c)
+{
+    if (!c->tom) {
+        SendMessageW(c->e, EM_EXSETSEL, 0, (LPARAM)&c->sel);
+        SendMessageW(c->e, EM_SETSCROLLPOS, 0, (LPARAM)&c->scroll);
+    }
+    SendMessageW(c->e, EM_SETMODIFY, (WPARAM)(c->was_mod ? TRUE : FALSE), 0);
+    if (!c->tom) SendMessageW(c->e, WM_SETREDRAW, TRUE, 0);
+
+    c->h->suppress--;
+
+    if (c->tom) {
+        c->tom->lpVtbl->Undo(c->tom, tomResume, 0);
+        c->tom->lpVtbl->Release(c->tom);
+        c->tom = 0;
+    }
+}
+
+/* Colours [from,to) from the lexer: the default colour over the whole range
+ * first, then the spans on top of it.  Tokenising is done in slices, because
+ * the span array is fixed and a large range would overflow it -- and each
+ * slice still starts from the nearest point the core can promise is outside
+ * any string or block comment, which is what keeps the cost independent of
+ * how far down the file the range happens to be. */
 static void colour_range(note_host *h, HWND e, int lang, int from, int to)
 {
-    CHARFORMAT2W   cf;
-    CHARRANGE      sel, r;
-    ITextDocument *tom;
-    POINT          scroll;
-    int            was_mod, at;
+    fmt_ctx c;
+    int     at;
 
     if (from < 0) from = 0;
     if (to > h->cache_len) to = h->cache_len;
     if (to <= from) return;
 
-    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
-    SendMessageW(e, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    /* The band is a background on characters, and the sweep below takes every
+     * background in this range off.  Saying so here is what gets it put back:
+     * curline_update() re-applies a band it no longer believes in, and every
+     * path that colours ends up there. */
+    {
+        win_doc *d = &h->d[h->app.active];
+        if (e == d->edit && d->cur_valid &&
+            d->cur_from < to && d->cur_to > from)
+            d->cur_valid = 0;
+    }
 
-    /* Recolouring sets the control's modify flag, and its EN_CHANGE can
-     * arrive after we have stopped suppressing.  Remember the real state and
-     * put it back, so opening a file never leaves it looking edited. */
-    was_mod = (int)SendMessageW(e, EM_GETMODIFY, 0, 0);
+    fmt_begin(&c, h, e);
 
-    /* Formatting would otherwise pile records onto the undo stack, and Ctrl+Z
-     * would undo the highlighter instead of the typing. */
-    tom = tom_open(e);
-    if (tom) tom->lpVtbl->Undo(tom, tomSuspend, 0);
-
-    h->suppress++;
-    SendMessageW(e, WM_SETREDRAW, FALSE, 0);
-
-    memset(&cf, 0, sizeof(cf));
-    cf.cbSize      = sizeof(cf);
-    cf.dwMask      = CFM_COLOR;
-    cf.crTextColor = cr(h->theme.fg);
-
-    r.cpMin = from; r.cpMax = to;
-    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
-    SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    fmt_set(&c, from, to, cr(h->theme.fg), 0);
+    /* And the page behind them.  A caret band is a background on the
+     * characters of one line, and an edit moves those characters out from
+     * under the offsets the band was recorded on -- so the band that is about
+     * to be put back is also the only one allowed to survive this.  Without
+     * this line every split paragraph left its wash behind and the document
+     * slowly filled with stripes the caret had visited. */
+    fmt_set(&c, from, to, FMT_AUTO, 1);
 
     for (at = from; lang != LANG_NONE && at < to; ) {
         int end = at + HL_SLICE;
@@ -640,17 +757,13 @@ static void colour_range(note_host *h, HWND e, int lang, int from, int to)
                                h->spans, MAX_SPANS);
 
         for (i = 0; i < nspans; i++) {
-            if (h->spans[i].start + h->spans[i].len <= at) continue;
-            if (h->spans[i].start >= end) break;
-            r.cpMin = h->spans[i].start;
-            r.cpMax = h->spans[i].start + h->spans[i].len;
-            if (r.cpMin < at)  r.cpMin = at;
-            if (r.cpMax > end) r.cpMax = end;
-            cf.crTextColor = cr(h->theme.tok[h->spans[i].kind]);
-            SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
-            SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+            int lo = h->spans[i].start, hi = h->spans[i].start + h->spans[i].len;
+            if (hi <= at)  continue;
+            if (lo >= end) break;
+            if (lo < at)  lo = at;
+            if (hi > end) hi = end;
+            fmt_set(&c, lo, hi, cr(h->theme.tok[h->spans[i].kind]), 0);
         }
-        cf.crTextColor = cr(h->theme.fg);
 
         /* A slice dense enough to fill the span array would leave its tail
          * uncoloured, and the caller is about to record it as done.  Stop at
@@ -662,16 +775,7 @@ static void colour_range(note_host *h, HWND e, int lang, int from, int to)
         at = end;
     }
 
-    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
-    SendMessageW(e, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    SendMessageW(e, EM_SETMODIFY, (WPARAM)(was_mod ? TRUE : FALSE), 0);
-    SendMessageW(e, WM_SETREDRAW, TRUE, 0);
-    h->suppress--;
-
-    if (tom) {
-        tom->lpVtbl->Undo(tom, tomResume, 0);
-        tom->lpVtbl->Release(tom);
-    }
+    fmt_end(&c);
 }
 
 /* -------------------------------------------------------------------------
@@ -702,44 +806,51 @@ static COLORREF curline_rgb(note_host *h);
 /* Both halves of the work are the same call twice, so it is written once. */
 static void band_apply(note_host *h, HWND e, int from, int to, int on)
 {
-    CHARFORMAT2W   cf;
-    CHARRANGE      sel, r;
-    ITextDocument *tom;
-    POINT          scroll;
-    int            was_mod;
+    fmt_ctx c;
 
     if (to <= from) return;
 
-    SendMessageW(e, EM_EXGETSEL, 0, (LPARAM)&sel);
-    SendMessageW(e, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
-    was_mod = (int)SendMessageW(e, EM_GETMODIFY, 0, 0);
+    fmt_begin(&c, h, e);
+    fmt_set(&c, from, to, on ? curline_rgb(h) : FMT_AUTO, 1);
+    fmt_end(&c);
+}
 
-    tom = tom_open(e);
-    if (tom) tom->lpVtbl->Undo(tom, tomSuspend, 0);
+/* The rows [from,to) occupies, and nothing else.  The band's ends are drawn
+ * by hand in WM_PAINT -- see curline_tail() -- so a band that moves has to
+ * ask for the rows it left and the rows it landed on to be repainted.  Asking
+ * for the whole client area instead is what a caret moving down a file looked
+ * like: every row redrawn on every press of an arrow key. */
+static void band_rows(note_host *h, HWND e, int from, int to)
+{
+    RECT   rc, r;
+    POINTL p;
+    int    rowh;
 
-    h->suppress++;
-    SendMessageW(e, WM_SETREDRAW, FALSE, 0);
+    if (to < from) return;
 
-    memset(&cf, 0, sizeof(cf));
-    cf.cbSize = sizeof(cf);
-    cf.dwMask = CFM_BACKCOLOR;
-    if (on) cf.crBackColor = curline_rgb(h);
-    else    cf.dwEffects   = CFE_AUTOBACKCOLOR;   /* back to the page */
+    GetClientRect(e, &rc);
 
-    r.cpMin = from; r.cpMax = to;
-    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&r);
-    SendMessageW(e, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    p.x = p.y = 0;
+    SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)from);
+    r.top = p.y;
 
-    SendMessageW(e, EM_EXSETSEL, 0, (LPARAM)&sel);
-    SendMessageW(e, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    SendMessageW(e, EM_SETMODIFY, (WPARAM)(was_mod ? TRUE : FALSE), 0);
-    SendMessageW(e, WM_SETREDRAW, TRUE, 0);
-    h->suppress--;
+    p.x = p.y = 0;
+    SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)(to > from ? to - 1 : from));
 
-    if (tom) {
-        tom->lpVtbl->Undo(tom, tomResume, 0);
-        tom->lpVtbl->Release(tom);
-    }
+    rowh = MulDiv(h->line_h, h->app.zoom, 100);
+    if (rowh <= 0) rowh = 16;
+    r.bottom = p.y + rowh;
+
+    /* Nothing the control would answer for -- an offset it has scrolled past,
+     * or one it has not laid out yet.  The whole area then, which is correct
+     * and merely more work. */
+    if (r.bottom <= r.top) { r.top = rc.top; r.bottom = rc.bottom; }
+
+    r.left  = rc.left;
+    r.right = rc.right;
+    if (r.top    < rc.top)    r.top    = rc.top;
+    if (r.bottom > rc.bottom) r.bottom = rc.bottom;
+    if (r.bottom > r.top) InvalidateRect(e, &r, FALSE);
 }
 
 void curline_update(note_host *h)
@@ -772,20 +883,41 @@ void curline_update(note_host *h)
 
     if (d->cur_valid && d->cur_from == from && d->cur_to == to && want) return;
 
+    /* Still the same line, only longer or shorter: what typing does, on every
+     * keystroke.  Taking the band off and putting it back would be a frame
+     * with no band in it -- the blink the caret's line used to have under
+     * every character typed -- so the band is extended over the characters
+     * that were added and withdrawn from the ones that went. */
+    if (want && d->cur_valid && d->cur_from == from) {
+        /* Over the whole line when it grew, not only over the tail: a
+         * character typed at the start of it takes its formatting from the
+         * one before it, which is the previous line's break and carries no
+         * band.  One range either way, so the wider one costs nothing. */
+        if (to > d->cur_to) band_apply(h, e, from, to, 1);
+        else                band_apply(h, e, to, d->cur_to, 0);
+        band_rows(h, e, from, to > d->cur_to ? to : d->cur_to);
+        d->cur_to = to;
+        return;
+    }
+
     /* Taking the old band off first: after an edit the offsets it was on may
      * no longer be the line they were, but putting a background back to the
-     * page can only ever remove a band, never leave one in the wrong place. */
-    if (d->cur_valid) band_apply(h, e, d->cur_from, d->cur_to, 0);
+     * page can only ever remove a band, never leave one in the wrong place --
+     * and the recolouring that follows an edit clears the backgrounds over
+     * everything it touches, which is what catches the rest. */
+    if (d->cur_valid) {
+        band_apply(h, e, d->cur_from, d->cur_to, 0);
+        band_rows(h, e, d->cur_from, d->cur_to);
+    }
     d->cur_valid = 0;
 
     if (want) {
         band_apply(h, e, from, to, 1);
+        band_rows(h, e, from, to);
         d->cur_from  = from;
         d->cur_to    = to;
         d->cur_valid = 1;
     }
-
-    InvalidateRect(e, NULL, FALSE);
 }
 
 static COLORREF curline_rgb(note_host *h)
@@ -797,7 +929,7 @@ static COLORREF curline_rgb(note_host *h)
  * control has drawn the row itself.  Called from EditProc's WM_PAINT, which is
  * the only moment at which those pixels are known to be background and nothing
  * else. */
-void curline_tail(note_host *h, HWND e)
+void curline_tail(note_host *h, HWND e, const RECT *clip)
 {
     win_doc *d = &h->d[h->app.active];
     HDC      dc;
@@ -809,6 +941,13 @@ void curline_tail(note_host *h, HWND e)
     if (!d->cur_valid || e != d->edit) return;
 
     GetClientRect(e, &rc);
+    /* Only the rows the control has just redrawn: anything outside them is
+     * still showing pixels this fill has no business on. */
+    if (clip) {
+        if (clip->top    > rc.top)    rc.top    = clip->top;
+        if (clip->bottom < rc.bottom) rc.bottom = clip->bottom;
+        if (rc.bottom <= rc.top) return;
+    }
 
     first = (int)SendMessageW(e, EM_EXLINEFROMCHAR, 0, (LPARAM)d->cur_from);
     last  = (int)SendMessageW(e, EM_EXLINEFROMCHAR, 0,
@@ -963,6 +1102,9 @@ void hl_step(note_host *h)
 
     if (hl_cover(h, e, d, hl_lang(h), want_from, want_to, HL_CHUNK))
         KillTimer(h->wnd, TIMER_HL);
+
+    /* A chunk that reached the caret's line has just cleared its band. */
+    curline_update(h);
 }
 
 /* Colours what is on screen, now, and arms the timer for the rest. */
@@ -1133,8 +1275,16 @@ LRESULT CALLBACK EditProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     /* After the control, never instead of it: the tail is drawn over pixels
      * the control has just painted as background and nothing else. */
     case WM_PAINT: {
-        LRESULT r = CallWindowProcW(old, wnd, msg, wp, lp);
-        curline_tail(&g, wnd);
+        RECT    upd;
+        LRESULT r;
+        /* What the control is about to repaint.  The tail is drawn through a
+         * window DC of our own -- the control's paint DC is gone by the time
+         * it returns -- and a window DC is clipped to nothing, so without
+         * this the fill reaches rows the control never touched and leaves
+         * stripes of band colour behind on them. */
+        if (!GetUpdateRect(wnd, &upd, FALSE)) upd.left = upd.right = 0;
+        r = CallWindowProcW(old, wnd, msg, wp, lp);
+        if (upd.right > upd.left) curline_tail(&g, wnd, &upd);
         return r;
     }
 

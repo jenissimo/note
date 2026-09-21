@@ -669,6 +669,29 @@ int note_open(note_app *a, const nchar *path)
     if (doc < 0) doc = note_new_doc(a);
     if (doc < 0) return 0;
 
+    /* A name with nothing behind it is a file the user is about to write, not
+     * a mistake: `note notes.txt` on a path that does not exist opens an empty
+     * document already carrying that name, and the first save creates it.
+     * That is what every editor launched from a shell does, and the box that
+     * used to come up instead said nothing the empty tab does not say.
+     *
+     * Only when the platform can tell us.  Without file_exists the old
+     * reading stands, because a load that fails is then the only evidence
+     * there is, and it cannot tell "missing" from "unreadable" apart. */
+    if (a->ops->file_exists && !a->ops->file_exists(a->host, path)) {
+        note_doc *d = &a->docs[doc];
+        a->ops->text_set(a->host, doc, N(""));
+        n_copy(d->path, path, NOTE_PATH_MAX);
+        d->lang  = note_lang_from_path(path);
+        d->dirty = 0;
+        a->ops->set_modified(a->host, doc, 0);
+        refresh_tab(a, doc);
+        note_select_doc(a, doc);
+        note_update_title(a);
+        a->ops->rehighlight(a->host);
+        return 1;
+    }
+
     if (!note_load(a, doc, path)) {
         if (doc > 0) note_close_doc(a, doc);
         return 0;
